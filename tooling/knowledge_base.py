@@ -13,7 +13,10 @@ ChromaDB 在这里的角色：
 """
 import asyncio
 import hashlib
+import json
 import logging
+import os
+import threading
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -38,7 +41,8 @@ class KnowledgeBase:
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
     ):
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
+        # 优先连接独立 ChromaDB 服务；默认 embedding_function 在客户端生成向量。
+        self._write_lock = threading.RLock()
         self._use_server = False
         try:
             # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
@@ -50,22 +54,25 @@ class KnowledgeBase:
             self._client.heartbeat()
             self._use_server = True
             logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
+        except Exception as ex:
+            if os.getenv("ECHOMIND_ENV", "development").lower() == "production":
+                raise RuntimeError("生产环境知识库 ChromaDB 不可用，禁止切换到本地库") from ex
             logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
             self._client = chromadb.PersistentClient(
                 path=chroma_path,
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
+        # 不传 embedding_function 时使用 ChromaDB 客户端默认模型；
+        # Docker 已预下载模型，本地运行首次使用可能触发下载。
         self._collection = self._client.get_or_create_collection(
             name=self.COLLECTION_NAME,
             metadata={"description": "EchoMind RAG 知识库"},
         )
 
         # 如果知识库为空，导入默认文档
-        if self._collection.count() == 0:
+        seed_demo = os.getenv("ECHOMIND_SEED_DEMO_DOCS", "true").lower() in {"1", "true", "yes"}
+        if os.getenv("ECHOMIND_ENV", "development").lower() != "production" and seed_demo and self._collection.count() == 0:
             self._load_default_docs()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
@@ -77,26 +84,54 @@ class KnowledgeBase:
         documents 格式: [{"title": "...", "content": "..."}, ...]
         长文档会自动切片（每片 500 字）。
         """
-        ids, docs, metas = [], [], []
-
+        # 相同文档身份在同一批次只采用最后一个版本，避免重复 ID。
+        prepared = {}
         for doc in documents:
-            title   = doc.get("title", "")
-            content = doc.get("content", "")
-            chunks  = self._chunk_text(content, chunk_size=500)
+            title, content = doc.get("title", ""), doc.get("content", "")
+            if not isinstance(title, str) or not isinstance(content, str):
+                raise ValueError("文档 title 和 content 必须是字符串")
+            if not title.strip() or not content.strip():
+                raise ValueError("文档标题和内容不能为空")
+            explicit_id = doc.get("document_id")
+            if explicit_id is not None and (not isinstance(explicit_id, str) or not explicit_id.strip()):
+                raise ValueError("document_id 必须是非空字符串")
+            identity = json.dumps(["explicit", explicit_id] if explicit_id else ["title", title], ensure_ascii=True)
+            if not isinstance(identity, str):
+                raise ValueError("document_id 必须是字符串")
+            prepared[identity] = (title, content, bool(doc.get("document_id")))
 
-            for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
-                ids.append(doc_id)
-                docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
-
-        if ids:
-            # ID 由文档内容稳定生成；upsert 使重复导入幂等，同时允许同 ID 内容更新。
-            # ChromaDB 会自动生成或更新 Embedding。
-            self._collection.upsert(ids=ids, documents=docs, metadatas=metas)
-            logger.info(f"知识库写入 {len(ids)} 个文档片段")
-
-        return len(ids)
+        count = 0
+        with self._write_lock:
+            for identity, (title, content, explicit) in prepared.items():
+                document_id = hashlib.sha256(identity.encode()).hexdigest()
+                chunks = self._chunk_text(content, chunk_size=500)
+                version = hashlib.sha256(content.encode()).hexdigest()
+                ids = [f"{document_id}:{i}" for i in range(len(chunks))]
+                existing = self._collection.get(where={"document_id": document_id}, include=["metadatas"])
+                old_ids = set(existing["ids"])
+                # 仅迁移归属可验证的旧身份；旧显式 ID 与 title: 前缀冲突时保留旧记录供核验。
+                kind, value = json.loads(identity)
+                legacy_identity = value if explicit else f"title:{title}"
+                if not explicit or not value.startswith("title:"):
+                    legacy_id = hashlib.sha256(legacy_identity.encode()).hexdigest()
+                    previous = self._collection.get(where={"document_id": legacy_id}, include=["metadatas"])
+                    old_ids.update(i for i, meta in zip(previous["ids"], previous["metadatas"])
+                                   if (meta or {}).get("title") == title)
+                if not explicit:
+                    # 兼容旧版只有 title/chunk_index 元数据的片段。
+                    legacy = self._collection.get(where={"title": title}, include=["metadatas"])
+                    old_ids.update(i for i, meta in zip(legacy["ids"], legacy["metadatas"])
+                                   if not (meta or {}).get("document_id"))
+                self._collection.upsert(ids=ids, documents=chunks, metadatas=[
+                    {"title": title, "document_id": document_id, "version": version,
+                     "chunk_index": i, "total_chunks": len(chunks)} for i in range(len(chunks))
+                ])
+                stale = old_ids - set(ids)
+                if stale:
+                    self._collection.delete(ids=list(stale))
+                count += len(chunks)
+        logger.info("知识库写入 %s 个文档片段", count)
+        return count
 
     async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
         """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
@@ -108,9 +143,14 @@ class KnowledgeBase:
 
         ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
         """
+        if type(top_k) is not int or not 1 <= top_k <= 20:
+            raise ValueError("top_k 必须是 1–20 的整数")
+        count = self._collection.count()
+        if not count:
+            return []
         results = self._collection.query(
             query_texts=[query],
-            n_results=top_k,
+            n_results=min(top_k, count),
         )
 
         items = []
@@ -125,6 +165,8 @@ class KnowledgeBase:
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),
+                    "document_id": meta.get("document_id", ""),
+                    "version": meta.get("version", ""),
                 })
 
         return items
@@ -168,6 +210,8 @@ class KnowledgeBase:
         current = ""
         # 按句子切分
         sentences = text.replace("\n", "。").split("。")
+        sentences = [sent[i:i + chunk_size] for sent in sentences
+                     for i in range(0, len(sent), chunk_size)]
         for sent in sentences:
             sent = sent.strip()
             if not sent:

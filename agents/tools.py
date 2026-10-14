@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING, Union, Tuple
 
 if TYPE_CHECKING:
     from agents.agent_orchestrator import Request
@@ -36,6 +36,8 @@ class AgentToolSpec:
     description: str
     input_schema: Dict[str, Any]
     handler: AgentToolHandler
+    allowed_agents: Optional[Tuple[str, ...]] = None
+    retry_safe: bool = True
 
 
 def make_tool(
@@ -179,7 +181,7 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
 
     async def search_knowledge_base(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
         query = str(args.get("query") or req.message or "").strip()
-        top_k = int(args.get("top_k", 5) or 5)
+        top_k = args.get("top_k", 5)
         if not query:
             return {"success": False, "error": "query 不能为空", "results": []}
         if tool_manager is None:
@@ -212,8 +214,8 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
             "search_knowledge_base",
             "检索知识库并返回最相关的文档片段；可用于通用、技术、账单和升级场景。",
             {
-                "query": {"type": "string", "description": "用户问题或检索关键词"},
-                "top_k": {"type": "integer", "description": "返回结果条数"},
+                "query": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "用户问题或检索关键词"},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 20, "description": "返回结果条数"},
             },
             search_knowledge_base,
             required=["query"],

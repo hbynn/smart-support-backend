@@ -9,9 +9,10 @@ import logging
 import os
 import pathlib
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 
 _ROOT = str(pathlib.Path(__file__).parent.parent.resolve())
@@ -20,7 +21,7 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Query, Request as HTTPRequest
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
@@ -48,7 +49,13 @@ _memory       = None
 _tool_manager = None
 _monitor      = None
 _evaluator    = None
+_eval_orchestrator = None
+_eval_tool_manager = None
 _skill_manager = None
+_profile_updater = None
+_mcp_client = None
+from evaluation.jobs import EvaluationJobs
+_eval_jobs = EvaluationJobs()
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -66,15 +73,17 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _eval_orchestrator, _eval_tool_manager, _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _profile_updater, _mcp_client
 
+    from core.access import identity
+    identity("")  # 启动时验证生产鉴权配置
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request, build_shared_rag_tools
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
-    from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
+    from tooling.knowledge_base import KnowledgeBase
+    from tooling.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
@@ -146,8 +155,8 @@ async def lifespan(app: FastAPI):
         schema={
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
-                "top_k": {"type": "integer"},
+                "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             "required": ["query"],
         },
@@ -155,8 +164,14 @@ async def lifespan(app: FastAPI):
         supports_rerank=True,
         fallback=knowledge_fallback,
     ))
-    if _orchestrator is not None:
-        _orchestrator.set_shared_tools(build_shared_rag_tools(_tool_manager))
+    from tooling.mcp_client import StandardMCPClient, load_servers
+    from tooling.mcp_server import configure
+    configure(kb, _tool_manager)
+    mcp_config = pathlib.Path(os.getenv("MCP_SERVERS_CONFIG", str(pathlib.Path(_ROOT) / "config/mcp_servers.json")))
+    enabled = os.getenv("MCP_EXTERNAL_ENABLED", "true").lower() in {"1", "true", "yes"}
+    _mcp_client = StandardMCPClient(_tool_manager, load_servers(mcp_config) if enabled else [], _refresh_agent_tools)
+    _refresh_agent_tools()
+    await _mcp_client.start()
 
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
@@ -169,9 +184,13 @@ async def lifespan(app: FastAPI):
     )
     await _monitor.start()
 
-    # 评测器
+    # 评测与线上使用独立路由状态、工具缓存和熔断器。
+    _eval_tool_manager = _tool_manager.fork()
+    _eval_orchestrator = AgentOrchestrator(api_key=cfg["api_key"], base_url=cfg.get("base_url"),
+        model=cfg["model"], skill_manager=_skill_manager)
+    _refresh_agent_tools()
     _evaluator = EndToEndEvaluator(
-        orchestrator=_orchestrator,
+        orchestrator=_eval_orchestrator,
         recognizer=recognizer,
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
@@ -179,13 +198,46 @@ async def lifespan(app: FastAPI):
         baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
     )
 
+    from core.concurrency import ProfileUpdater
+    _profile_updater = ProfileUpdater(_memory, workers=int(os.getenv("PROFILE_UPDATE_WORKERS", "4")))
+    _profile_updater.start()
     logger.info("EchoMind 已就绪")
-    yield
+    async with standard_mcp_server.session_manager.run():
+        try:
+            yield
+        finally:
+            await _eval_jobs.close()
+            await _profile_updater.close()
+            await _mcp_client.close()
+            await _monitor.stop()
+            if _memory is not None:
+                await _memory.close()
+            configure(None)
+            logger.info("EchoMind 已关闭")
 
-    await _monitor.stop()
-    if _memory is not None:
-        await _memory.close()
-    logger.info("EchoMind 已关闭")
+
+def _refresh_agent_tools():
+    from agents.tools import build_shared_rag_tools
+    if _orchestrator is not None and _tool_manager is not None:
+        tools = build_shared_rag_tools(_tool_manager)
+        if _mcp_client is not None:
+            tools.update(_mcp_client.agent_tools())
+        _orchestrator.set_shared_tools(tools)
+    if _eval_orchestrator is not None:
+        from dataclasses import replace
+        for name in list(_eval_tool_manager._tools):
+            if name not in _tool_manager._tools:
+                _eval_tool_manager.unregister(name)
+        for name, tool in _tool_manager._tools.items():
+            if name not in _eval_tool_manager._tools or _eval_tool_manager._tools[name].handler is not tool.handler or _eval_tool_manager._tools[name].schema != tool.schema:
+                _eval_tool_manager.register(replace(tool))
+        eval_tools = build_shared_rag_tools(_eval_tool_manager)
+        if _mcp_client is not None:
+            eval_tools.update(_mcp_client.agent_tools(_eval_tool_manager))
+        _eval_orchestrator.set_shared_tools({name: spec for name, spec in eval_tools.items() if spec.retry_safe})
+
+
+from tooling.mcp_server import http_app as standard_mcp_app, server as standard_mcp_server
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -204,9 +256,38 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def access_control(request: HTTPRequest, call_next):
+    from core.access import identity
+    from fastapi.responses import JSONResponse
+    try:
+        account = identity(request.headers.get("authorization", ""))
+    except (ValueError, TypeError):
+        return JSONResponse({"detail": "服务鉴权配置无效"}, status_code=503)
+    request.state.account = account
+    if account is not None and request.url.path != "/health" and request.method != "OPTIONS":
+        if not account:
+            return JSONResponse({"detail": "需要有效 Bearer Token"}, status_code=401)
+        reader = request.url.path in {"/chat", "/search", "/knowledge/stats", "/skills", "/mcp", "/mcp/"}
+        if not reader and account["role"] != "admin":
+            return JSONResponse({"detail": "该接口需要管理员权限"}, status_code=403)
+    is_chat = request.url.path == "/chat" and request.method == "POST"
+    started = time.monotonic()
+    if is_chat and _monitor is not None and "requests_total" in _monitor._prom:
+        _monitor._prom["requests_total"].inc()
+    response = await call_next(request)
+    if is_chat:
+        elapsed = (time.monotonic() - started) * 1000
+        response.headers["Server-Timing"] = f"chat;dur={elapsed:.1f}"
+        if _monitor is not None and "chat_latency_ms" in _monitor._prom:
+            _monitor._prom["chat_latency_ms"].labels(status=str(response.status_code)).observe(elapsed)
+    return response
+
+
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
-    message:     str
+    message:     str = Field(min_length=1, max_length=12000)
+    client_request_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     user_id:     str = "anonymous"
     conv_id:     Optional[str] = None
 
@@ -230,6 +311,10 @@ class ChatResponse(BaseModel):
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    intent_embedding_source: str = "local-ngram"
+    status: Literal["success", "partial", "failed"] = "success"
+    retryable: bool = False
+    error_code: Optional[str] = None
 
 
 class ToolTraceResponse(BaseModel):
@@ -247,7 +332,7 @@ class RecentToolTracesResponse(BaseModel):
 async def health():
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
-    return {"status": "ok", "agents": _orchestrator.get_stats()}
+    return {"status": "ok", "agents": {} if os.getenv("ECHOMIND_API_TOKENS") else _orchestrator.get_stats()}
 
 
 @app.get("/skills", tags=["Skills"])
@@ -270,7 +355,7 @@ async def reload_skills():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, http_request: HTTPRequest):
     """
     主对话接口。完整流程：
       记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
@@ -278,66 +363,103 @@ async def chat(req: ChatRequest):
     if _orchestrator is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
+    account = getattr(http_request.state, "account", None)
+    if account:
+        req.user_id = account["user_id"]
     from agents.agent_orchestrator import Request as OrcReq
-    from memory.conversation_memory import MsgRole
 
-    conv_id = req.conv_id or str(uuid.uuid4())
+    client_id = req.client_request_id or str(uuid.uuid4())
+    conv_id = req.conv_id or str(uuid.uuid5(uuid.NAMESPACE_URL, req.user_id + ":" + client_id))
+    started = time.monotonic()
 
-    # 1. 读取记忆上下文
-    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
+    def render(reply):
+        if reply.status == "failed":
+            from fastapi.responses import JSONResponse
+            return JSONResponse(reply.model_dump(), status_code=503)
+        return reply
 
-    # 2. 构建编排请求（含对话历史，用于意图识别上下文）
-    history = [
-        {"role": m.role.value, "content": m.content}
-        for m in mem_ctx.recent_messages[-5:]
-    ] if mem_ctx.recent_messages else None
+    from core.concurrency import ConversationBusyError, LeaseLostError
+    try:
+        async with asyncio.timeout(50), _memory.conversation(req.user_id, conv_id):
+            receipt = await _memory.get_turn_receipt(req.user_id, conv_id, client_id)
+            if receipt:
+                if receipt["message"] != req.message:
+                    raise HTTPException(409, "同一 client_request_id 不能用于不同消息")
+                previous = ChatResponse(**receipt["response"])
+                if previous.status != "failed" or not previous.retryable:
+                    return render(previous)
+            # 1. 读取记忆上下文
+            mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
-    intent_result = await _orchestrator.recognize_intent(req.message, history=history)
-    full_context = mem_ctx.to_prompt_text()
+            # 2. 构建编排请求（含对话历史，用于意图识别上下文）
+            history = [
+                {"role": m.role.value, "content": m.content}
+                for m in mem_ctx.recent_messages[-5:]
+            ] if mem_ctx.recent_messages else None
 
-    orch_req = OrcReq(
-        message=req.message,
-        user_id=req.user_id,
-        conv_id=conv_id,
-        context=full_context,
-        history=history,
-        entities=intent_result.entities,
-        intent=intent_result.intent,
-        intent_group=intent_result.intent_group,
-        urgency=intent_result.urgency,
-        intent_confidence=intent_result.confidence,
-    )
+            intent_result = await _orchestrator.recognize_intent(req.message, history=history)
+            full_context = mem_ctx.to_prompt_text()
 
-    # 3. 执行
-    result = await _orchestrator.run(orch_req)
+            orch_req = OrcReq(
+                message=req.message,
+                user_id=req.user_id,
+                conv_id=conv_id,
+                context=full_context,
+                history=history,
+                entities=intent_result.entities,
+                intent=intent_result.intent,
+                intent_group=intent_result.intent_group,
+                urgency=intent_result.urgency,
+                intent_confidence=intent_result.confidence,
+                conversation_state=getattr(mem_ctx, "state", {}),
+            )
 
-    # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
+            async def before_unsafe_tool(name):
+                # 在产生副作用之前持久化；超时/崩溃后同一 ID 不会重放未知结果。
+                marker = ChatResponse(conv_id=conv_id, request_id=orch_req.request_id,
+                    response="该请求涉及可能修改数据的工具，请先核验执行结果再发起新的请求。",
+                    intent=intent_result.intent.value, agent_type="unknown", escalated=False,
+                    latency_ms=(time.monotonic() - started) * 1000,
+                    status="failed", retryable=False, error_code="tool_outcome_unknown")
+                await _memory.commit_turn(req.user_id, conv_id, client_id, req.message, marker.model_dump())
+            orch_req.before_unsafe_tool = before_unsafe_tool
 
-    # 5. 异步更新用户画像（不阻塞响应）
-    asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
+            # 3. 执行
+            result = await _orchestrator.run(orch_req)
 
-    return ChatResponse(
-        conv_id=conv_id,
-        request_id=result.request_id,
-        response=result.response,
-        intent=result.intent.value if result.intent else "other",
-        intent_group=intent_result.intent_group,
-        agent_type=result.agent_type.value,
-        agent_types=[agent_type.value for agent_type in result.agent_types],
-        primary_agent=result.primary_agent.value if result.primary_agent else result.agent_type.value,
-        supporting_agents=[agent_type.value for agent_type in result.supporting_agents],
-        tools_used=result.tools_used,
-        routing_reason=result.routing_reason,
-        routing_confidence=result.routing_confidence,
-        escalated=result.escalated,
-        latency_ms=round(result.latency_ms, 1),
-        knowledge_used="search_knowledge_base" in result.tools_used,
-        entities=intent_result.entities,
-        intent_confidence=round(intent_result.confidence, 4),
-        intent_source_scores=intent_result.source_scores,
-    )
+            response = ChatResponse(
+                conv_id=conv_id,
+                request_id=result.request_id,
+                response=result.response,
+                intent=result.intent.value if result.intent else "other",
+                intent_group=intent_result.intent_group,
+                agent_type=result.agent_type.value,
+                agent_types=[agent_type.value for agent_type in result.agent_types],
+                primary_agent=result.primary_agent.value if result.primary_agent else result.agent_type.value,
+                supporting_agents=[agent_type.value for agent_type in result.supporting_agents],
+                tools_used=result.tools_used,
+                routing_reason=result.routing_reason,
+                routing_confidence=result.routing_confidence,
+                escalated=result.escalated,
+                latency_ms=round((time.monotonic() - started) * 1000, 1),
+                knowledge_used=any(t.get("tool_name") == "search_knowledge_base" and t.get("result_success") is True for t in result.tool_traces),
+                entities=orch_req.entities,
+                intent_confidence=round(intent_result.confidence, 4),
+                intent_source_scores=intent_result.source_scores,
+                intent_embedding_source=getattr(intent_result, "embedding_source", "local-ngram"),
+                status=result.status,
+                retryable=result.retryable,
+                error_code=result.error_code,
+            )
+            await _memory.commit_turn(req.user_id, conv_id, client_id, req.message, response.model_dump(),
+                                      _orchestrator.get_tool_trace(result.request_id), state=orch_req.conversation_state)
+            if response.status != "failed" and _profile_updater is not None:
+                _profile_updater.submit(req.user_id, conv_id)
+            return render(response)
+    except TimeoutError as ex:
+        raise HTTPException(504, "本轮处理超过 50 秒，请使用相同 client_request_id 重试") from ex
+    except (ConversationBusyError, LeaseLostError) as ex:
+        raise HTTPException(503, str(ex)) from ex
 
 
 @app.get("/monitor")
@@ -353,7 +475,8 @@ async def get_tool_trace(request_id: str):
     """查看某次请求的工具调用明细。"""
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
-    trace = _orchestrator.get_tool_trace(request_id)
+    trace = await _memory.get_trace(request_id) if _memory else None
+    trace = trace or _orchestrator.get_tool_trace(request_id)
     return ToolTraceResponse(
         request_id=request_id,
         found=trace is not None,
@@ -366,7 +489,7 @@ async def list_recent_tool_traces(limit: int = 20):
     """查看最近 N 次请求的工具调用明细。"""
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
-    return RecentToolTracesResponse(items=_orchestrator.get_recent_tool_traces(limit=limit))
+    return RecentToolTracesResponse(items=await _memory.recent_traces(limit) if _memory else _orchestrator.get_recent_tool_traces(limit=limit))
 
 
 @app.get("/metrics")
@@ -376,7 +499,7 @@ async def prometheus_metrics():
 
 
 @app.post("/search")
-async def search(query: str, top_k: int = 5):
+async def search(query: str = Query(min_length=1, max_length=2000), top_k: int = Query(default=5, ge=1, le=20)):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
     展示 MCP 工具调用的核心亮点。
@@ -391,6 +514,7 @@ class DocInput(BaseModel):
     """单篇文档输入。"""
     title:   str
     content: str
+    document_id: Optional[str] = None
 
 
 class BatchDocInput(BaseModel):
@@ -408,15 +532,21 @@ class EvalIntentInput(BaseModel):
 class EvalDialogInput(BaseModel):
     """对话质量评测用例。question 单轮，turns 多轮。"""
     question: Optional[str] = None
-    turns: Optional[List[str]] = None
+    reference_answer: Optional[str] = Field(default=None, max_length=12000)
+    evidence: Optional[str] = Field(default=None, max_length=20000)
+    turns: Optional[List[str]] = Field(default=None, max_length=50)
     user_id: Optional[str] = None
     conv_id: Optional[str] = None
+    expected_agent: Optional[Literal["general", "technical", "billing", "escalation"]] = None
+    expected_intent: Optional[str] = None
+    required_tools: List[str] = Field(default_factory=list, max_length=20)
+    expected_entities: Dict[str, List[str]] = Field(default_factory=dict)
 
 
 class EvalRunInput(BaseModel):
     """评测请求。为空时使用内置默认用例。"""
-    intent_cases: Optional[List[EvalIntentInput]] = None
-    dialog_cases: Optional[List[EvalDialogInput]] = None
+    intent_cases: Optional[List[EvalIntentInput]] = Field(default=None, max_length=200)
+    dialog_cases: Optional[List[EvalDialogInput]] = Field(default=None, max_length=100)
 
 
 @app.post("/knowledge/add", tags=["知识库"])
@@ -440,7 +570,14 @@ async def add_knowledge(body: BatchDocInput):
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = await kb.add_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
+    try:
+        count = await kb.add_documents_async([d.model_dump(exclude_none=True) for d in body.documents])
+    except ValueError as ex:
+        raise HTTPException(400, str(ex)) from ex
+    finally:
+        _tool_manager.invalidate_cache("knowledge_search")
+        if _eval_tool_manager is not None:
+            _eval_tool_manager.invalidate_cache("knowledge_search")
     total = await kb.doc_count_async()
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
 
@@ -461,14 +598,17 @@ async def upload_knowledge(file: UploadFile = File(...)):
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
 
-    content = await file.read()
+    filename = file.filename or "unknown"
+    if pathlib.Path(filename).suffix.lower() not in {".txt", ".md", ".json"}:
+        raise HTTPException(400, "仅支持 .txt、.md、.json 文件")
+    content = await file.read(10 * 1024 * 1024 + 1)
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件大小超过 10MB 限制")
 
     text = content.decode("utf-8", errors="ignore")
     filename = file.filename or "unknown"
 
-    if filename.endswith(".json"):
+    if filename.lower().endswith(".json"):
         import json as _json
         try:
             docs = _json.loads(text)
@@ -481,7 +621,15 @@ async def upload_knowledge(file: UploadFile = File(...)):
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
-    count = await kb.add_documents_async(docs)
+    try:
+        validated = [DocInput.model_validate(doc).model_dump(exclude_none=True) for doc in docs]
+        count = await kb.add_documents_async(validated)
+    except ValueError as ex:
+        raise HTTPException(400, "文档格式不正确：需要非空 title、content 和可选 document_id") from ex
+    finally:
+        _tool_manager.invalidate_cache("knowledge_search")
+        if _eval_tool_manager is not None:
+            _eval_tool_manager.invalidate_cache("knowledge_search")
     total = await kb.doc_count_async()
     return {
         "message": f"文件 {filename} 导入成功",
@@ -500,8 +648,26 @@ async def knowledge_stats():
     return {"total_chunks": await kb.doc_count_async()}
 
 
-@app.post("/eval/run")
+@app.post("/eval/run", status_code=202)
 async def run_eval(body: Optional[EvalRunInput] = None):
+    if _evaluator is None:
+        raise HTTPException(503, "服务未就绪")
+    snapshot = body.model_copy(deep=True) if body else None
+    try:
+        return _eval_jobs.submit(lambda progress: _execute_eval(snapshot, progress))
+    except RuntimeError as ex:
+        raise HTTPException(429, str(ex)) from ex
+
+
+@app.get("/eval/jobs/{job_id}")
+async def get_eval_job(job_id: str):
+    job = _eval_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "评测任务不存在或已过期；服务重启后需要重新提交")
+    return job
+
+
+async def _execute_eval(body: Optional[EvalRunInput] = None, progress=None):
     """运行内置评测用例，返回评测报告。"""
     if _evaluator is None:
         raise HTTPException(503, "服务未就绪")
@@ -530,9 +696,16 @@ async def run_eval(body: Optional[EvalRunInput] = None):
     report = await _evaluator.run(
         intent_cases=intent_cases,
         dialog_cases=dialog_cases,
+        progress=progress,
     )
     return {
         "pass_rate":       report.pass_rate,
+        "scope":           "orchestrator",
+        "status":          report.status,
+        "suite_id":        report.suite_id,
+        "regression_note": report.regression_note,
+        "valid_total":     report.valid_total,
+        "evaluation_errors": report.evaluation_errors,
         "total":           report.total,
         "passed":          report.passed,
         "avg_scores":      report.avg_scores,
@@ -549,6 +722,41 @@ async def run_eval(body: Optional[EvalRunInput] = None):
             for r in report.results
         ],
     }
+
+
+class MCPCallInput(BaseModel):
+    name: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.get("/integrations/embedding", tags=["Embedding"])
+async def embedding_status():
+    if _orchestrator is None:
+        raise HTTPException(503, "服务未就绪")
+    return _orchestrator._intent_recognizer._embedding.status()
+
+
+@app.get("/integrations/mcp", tags=["MCP"])
+async def mcp_status():
+    """查看外部标准 MCP 连接状态和已发现的白名单工具。"""
+    if _mcp_client is None:
+        raise HTTPException(503, "MCP 尚未初始化")
+    return _mcp_client.summary()
+
+
+@app.post("/integrations/mcp/call", tags=["MCP"])
+async def mcp_call(body: MCPCallInput):
+    """调试已配置的外部 MCP 工具，无需先调用 LLM。"""
+    if _mcp_client is None or _tool_manager is None:
+        raise HTTPException(503, "MCP 尚未初始化")
+    if not _mcp_client.owns_tool(body.name):
+        raise HTTPException(404, "MCP 工具未连接或未在配置白名单中")
+    result = await _tool_manager.call(body.name, body.arguments)
+    return {"success": result.success, "data": result.data, "error": result.error,
+            "cached": result.cached, "latency_ms": round(result.latency_ms, 1)}
+
+
+app.mount("/mcp", standard_mcp_app)
 
 
 # ── 交互式 CLI ────────────────────────────────────────────────────────────────
@@ -582,32 +790,59 @@ async def _cli():
         model=cfg["model"],
     )
 
+    from tooling.tool_manager import MCPToolManager, Tool
+    from tooling.knowledge_base import KnowledgeBase
+    from tooling.mcp_client import StandardMCPClient, load_servers
+    from agents.tools import build_shared_rag_tools
+    manager = MCPToolManager(**cfg)
+    kb = KnowledgeBase(chroma_host=os.getenv("CHROMA_HOST", "localhost"),
+                       chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
+                       chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/tmp/chroma"))
+    manager.register(Tool(name="knowledge_search", description="本地知识库检索",
+                          handler=kb.search_handler, schema={"type":"object", "properties":{
+                              "query":{"type":"string"}, "top_k":{"type":"integer", "minimum":1}},
+                              "required":["query"]}, cache_ttl=300, supports_rerank=True))
+    bridge = None
+    def refresh():
+        tools = build_shared_rag_tools(manager)
+        if bridge is not None:
+            tools.update(bridge.agent_tools())
+        orch.set_shared_tools(tools)
+    path = pathlib.Path(os.getenv("MCP_SERVERS_CONFIG", str(pathlib.Path(_ROOT) / "config/mcp_servers.json")))
+    enabled = os.getenv("MCP_EXTERNAL_ENABLED", "true").lower() in {"1", "true", "yes"}
+    bridge = StandardMCPClient(manager, load_servers(path) if enabled else [], refresh)
+    refresh()
+    await bridge.start()
+
     user_id, conv_id = "cli_user", str(uuid.uuid4())
 
-    while True:
-        try:
-            msg = input("你: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n再见 ʕ•ᴥ•ʔ")
-            break
-        if not msg or msg.lower() in ("quit", "exit", "退出"):
-            print("再见 ʕ•ᴥ•ʔ")
-            break
+    try:
+        while True:
+            try:
+                msg = (await asyncio.to_thread(input, "你: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n再见 ʕ•ᴥ•ʔ")
+                break
+            if not msg or msg.lower() in ("quit", "exit", "退出"):
+                print("再见 ʕ•ᴥ•ʔ")
+                break
 
-        ctx = await mem.get_context(user_id, conv_id, query=msg)
-        history = [
-            {"role": m.role.value, "content": m.content}
-            for m in ctx.recent_messages[-5:]
-        ] if ctx.recent_messages else None
-        req = Request(message=msg, user_id=user_id, conv_id=conv_id, context=ctx.to_prompt_text(), history=history)
-        result = await orch.run(req)
+            ctx = await mem.get_context(user_id, conv_id, query=msg)
+            history = [
+                {"role": m.role.value, "content": m.content}
+                for m in ctx.recent_messages[-5:]
+            ] if ctx.recent_messages else None
+            req = Request(message=msg, user_id=user_id, conv_id=conv_id, context=ctx.to_prompt_text(), history=history)
+            result = await orch.run(req)
 
-        await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
-        await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
+            await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
+            await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
-        print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
-
-    await mem.close()
+            print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
+    finally:
+        await bridge.close()
+        await manager._client.close()
+        await mem.close()
 
 
 if __name__ == "__main__":

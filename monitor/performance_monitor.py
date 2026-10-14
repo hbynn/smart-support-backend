@@ -22,7 +22,7 @@ from enum import Enum
 from typing import Any, Deque, Dict, List, Optional
 
 import httpx
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, REGISTRY, start_http_server
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,7 @@ class PerformanceMonitor:
         interval_s:       float = 10.0,
         webhook_url:      Optional[str] = None,
         prometheus_port:  Optional[int] = None,   # None = 不启动
+        registry=None,
     ):
         self._orchestrator = orchestrator
         self._tool_manager = tool_manager
@@ -138,25 +139,38 @@ class PerformanceMonitor:
         self._task:        Optional[asyncio.Task] = None
 
         # Prometheus 指标（可选）
-        self._prom: Dict[str, Any] = {}
-        if prometheus_port:
-            self._setup_prometheus(prometheus_port)
+        self._registry = registry if registry is not None else REGISTRY
+        self._prometheus_port = prometheus_port
+        self._http_server = None
+        self._registered = True
+        self._setup_prometheus()
+        for kind, agents in self._orchestrator._pool.items():
+            for i, agent in enumerate(agents):
+                agent.stats.observer = self._prom["agent_latency_ms"].labels(agent=f"{kind.value}_{i}").observe
 
-    def _setup_prometheus(self, port: int) -> None:
+    def _setup_prometheus(self) -> None:
         self._prom = {
-            "agent_success_rate": Gauge("agent_success_rate", "Agent 成功率", ["agent"]),
-            "agent_latency_ms":   Histogram("agent_latency_ms", "Agent 延迟", ["agent"]),
-            "tool_success_rate":  Gauge("tool_success_rate", "工具成功率", ["tool"]),
-            "requests_total":     Counter("requests_total", "总请求数"),
+            "agent_success_rate": Gauge("agent_success_rate", "Agent 成功率", ["agent"], registry=self._registry),
+            "agent_latency_ms": Histogram("agent_latency_ms", "Agent 延迟（毫秒）", ["agent"],
+                buckets=(10, 50, 100, 250, 500, 1000, 2000, 3000, 5000, 10000, 20000, 30000, 50000), registry=self._registry),
+            "chat_latency_ms": Histogram("chat_latency_ms", "聊天 HTTP 请求总耗时（毫秒）", ["status"],
+                buckets=(50, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 30000, 50000), registry=self._registry),
+            "tool_success_rate": Gauge("tool_success_rate", "工具成功率", ["tool"], registry=self._registry),
+            "requests_total": Counter("requests_total", "总请求数", registry=self._registry),
         }
-        start_http_server(port)
-        logger.info(f"Prometheus 已启动: :{port}")
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
         if self._active:
             return
+        if not self._registered:
+            for metric in self._prom.values():
+                self._registry.register(metric)
+            self._registered = True
+        if self._prometheus_port:
+            self._http_server, _ = start_http_server(self._prometheus_port, registry=self._registry)
+            logger.info(f"Prometheus 已启动: :{self._prometheus_port}")
         self._active = True
         self._task   = asyncio.create_task(self._loop())
         logger.info(f"Monitor 已启动，采集间隔 {self._interval}s")
@@ -169,6 +183,15 @@ class PerformanceMonitor:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
+        if self._http_server is not None:
+            await asyncio.to_thread(self._http_server.shutdown)
+            self._http_server.server_close()
+            self._http_server = None
+        if self._registered:
+            for metric in self._prom.values():
+                self._registry.unregister(metric)
+            self._registered = False
 
     # ── 采集循环 ──────────────────────────────────────────────────────────────
 
@@ -209,9 +232,10 @@ class PerformanceMonitor:
             # Prometheus
             if "agent_success_rate" in self._prom:
                 self._prom["agent_success_rate"].labels(agent=agent_key).set(sr)
-                self._prom["agent_latency_ms"].labels(agent=agent_key).observe(ms)
 
-            routing_penalties[agent_key] = self._routing_penalty(sr, ms)
+
+            routing_penalties[agent_key] = (self._routing_penalty(s["recent_success_rate"], s["recent_avg_ms"])
+                                          if s.get("recent_total", 0) >= 5 else 0.0)
 
         # ── 工具指标 ──────────────────────────────────────────────────────────
         for tool_name, s in tool_stats.items():

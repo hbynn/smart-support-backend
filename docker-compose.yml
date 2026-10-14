@@ -8,7 +8,7 @@ services:
     image: redis:7-alpine
     container_name: echomind-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-echomind123}
     volumes:
       - redis-data:/data
@@ -26,7 +26,7 @@ services:
     image: chromadb/chroma:0.5.23
     container_name: echomind-chromadb
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     environment:
       - IS_PERSISTENT=TRUE
       - PERSIST_DIRECTORY=/chroma/chroma
@@ -48,7 +48,7 @@ services:
     image: prom/prometheus:latest
     container_name: echomind-prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -75,7 +75,7 @@ services:
       target: production
     container_name: echomind-app
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - .env
     environment:
@@ -88,6 +88,7 @@ services:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
       - ./skills:/app/skills
+      - ./config/mcp_servers.json:/app/config/mcp_servers.json:ro
       - ./logs:/app/logs
     depends_on:
       redis:
@@ -98,7 +99,8 @@ services:
     networks:
       - echomind-network
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      # 生产镜像自带 Python，健康检查不依赖额外安装 curl。
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -109,7 +111,7 @@ services:
     image: nginx:alpine
     container_name: echomind-nginx
     ports:
-      - "80:80"
+      - "127.0.0.1:80:80"
     volumes:
       - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx-logs:/var/log/nginx
@@ -120,7 +122,8 @@ services:
     networks:
       - echomind-network
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost/health || exit 1"]
+      # 显式使用 IPv4，与 Nginx 的监听地址保持一致。
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
