@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import create_message, extract_text_content
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +144,8 @@ class IntentRecognizer:
     """
     端到端意图识别器。
 
-    初始化时不加载任何本地模型，所有 AI 能力通过 Anthropic API 调用。
-    模板 Embedding 在首次请求时懒加载并缓存，后续复用。
+    LLM 使用 Anthropic Messages 客户端，向量使用独立的硅基流动客户端。
+    模板向量在首次请求时生成并缓存；在线不可用时整次匹配回退本地 n-gram。
     """
 
     def __init__(
@@ -163,7 +163,10 @@ class IntentRecognizer:
         self.threshold = confidence_threshold
         from core.intent_embedding import IntentEmbedding
         self._embedding = IntentEmbedding()
-        self._embedding_enabled = True
+        embedding_enabled = os.getenv('INTENT_EMBEDDING_ENABLED', 'true').strip().lower()
+        if embedding_enabled not in {'true', 'false', '1', '0', 'yes', 'no', 'on', 'off'}:
+            raise ValueError('INTENT_EMBEDDING_ENABLED 必须为 true/false')
+        self._embedding_enabled = embedding_enabled in {'true', '1', 'yes', 'on'}
         self._cache: Dict[str, IntentResult] = {}
         self._cache_expiries: Dict[str, float] = {}
         self.cache_hits   = 0
@@ -189,7 +192,7 @@ class IntentRecognizer:
 
         t0 = time.monotonic()
 
-        # LLM 和 Embedding 并行（Embedding 不可用时跳过）
+        # LLM 和向量分支并行；provider=local 仍参与向量投票。
         llm_task = asyncio.create_task(self._llm_recognize(message, history))
         emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
         pat      = self._pattern_recognize(message)
@@ -198,7 +201,7 @@ class IntentRecognizer:
             llm, emb = await asyncio.gather(llm_task, emb_task)
         else:
             llm = await llm_task
-            emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
+            emb = {"intent": IntentCategory.OTHER, "confidence": 0.0, "source": "disabled"}
 
         intent, confidence, source_scores = self._vote(llm, emb, pat)
         entities = self._extract_entities(message)
@@ -213,7 +216,7 @@ class IntentRecognizer:
             reasoning=llm.get("reasoning", ""),
             latency_ms=(time.monotonic() - t0) * 1000,
             source_scores=source_scores,
-            embedding_source=emb.get("source", "local-ngram"),
+            embedding_source=emb.get("source", "unavailable"),
         )
 
         # LRU 缓存
@@ -224,6 +227,22 @@ class IntentRecognizer:
         self._cache[key] = result
         self._cache_expiries[key] = time.monotonic() + (60 if result.embedding_source == "local-ngram" and self._embedding.enabled else 300)
         return result
+
+    async def check_embedding(self, message: str) -> Dict[str, Any]:
+        """独立验证向量链路；不调用 LLM，也不写入意图识别结果缓存。"""
+        if not self._embedding_enabled:
+            return {'success': False, 'source': 'disabled', 'error': 'embedding_branch_disabled'}
+        started = time.monotonic()
+        result = await self._embedding_recognize(message)
+        source = result.get('source', 'unavailable')
+        return {
+            'success': source == 'siliconflow/' + self._embedding.MODEL,
+            'source': source,
+            'intent': result['intent'].value,
+            'confidence': result['confidence'],
+            'elapsed_ms': round((time.monotonic() - started) * 1000, 1),
+            'status': self._embedding.status(),
+        }
 
     def learn(self, message: str, correct: IntentCategory) -> None:
         """在线学习：将纠正样本加入模板，清除对应 Embedding 缓存。"""
@@ -276,7 +295,8 @@ class IntentRecognizer:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await asyncio.wait_for(self.client.messages.create(
+            resp = await asyncio.wait_for(create_message(self.client,
+                stage="intent",
                 model=self.model,
                 max_tokens=256,
                 temperature=0.1,
@@ -312,7 +332,7 @@ class IntentRecognizer:
             return {"intent": best_cat, "confidence": min(1.0, max(0.0, best_score)), "source": source}
         except Exception as ex:
             logger.warning(f"Embedding 识别失败: {ex}")
-            return {"intent": IntentCategory.OTHER, "confidence": 0.0}
+            return {"intent": IntentCategory.OTHER, "confidence": 0.0, "source": "unavailable"}
 
     def _pattern_recognize(self, message: str) -> Dict[str, Any]:
         """策略 3：关键词模式匹配（同步，零延迟兜底）。"""

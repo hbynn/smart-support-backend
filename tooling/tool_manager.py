@@ -25,7 +25,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import create_message, extract_text_content
+from core.concurrency import KeyedLocks
+from core.performance import measure_stage, record_event
 
 logger = logging.getLogger(__name__)
 
@@ -151,12 +153,14 @@ class MCPToolManager:
         self._tools: Dict[str, Tool] = {}
         self._cache_versions: Dict[str, int] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
+        self._search_locks = KeyedLocks()
 
     def fork(self):
         """共享只读依赖和 HTTP 客户端，隔离工具统计、熔断和缓存。"""
         other = object.__new__(type(self))
         other._client, other._model = self._client, self._model
         other._cache, other._cache_versions = {}, {}
+        other._search_locks = KeyedLocks()
         other._tools = {name: replace(tool) for name, tool in self._tools.items()}
         return other
 
@@ -324,7 +328,8 @@ class MCPToolManager:
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await asyncio.wait_for(self._client.messages.create(
+            resp = await asyncio.wait_for(create_message(self._client,
+                stage="rag.rewrite",
                 model=self._model, max_tokens=512, temperature=0.3,
                 messages=[{"role": "user", "content": prompt}],
             ), timeout=10)
@@ -353,6 +358,32 @@ class MCPToolManager:
             return ToolResult(False, [], tool_name, error="top_k 必须是 1–20 的整数")
         if not isinstance(query, str) or not query.strip() or len(query) > 2000:
             return ToolResult(False, [], tool_name, error="query 必须是 1–2000 字符的非空文本")
+        tool = self._tools.get(tool_name)
+        if tool is None:
+            return ToolResult(False, [], tool_name, error=f"工具不存在: {tool_name}")
+        version = self._cache_versions.get(tool_name, 0)
+        cache_name = f"{tool_name}:pipeline"
+        params = {"query": query, "top_k": top_k, "version": version}
+        # TTL=0 保留禁用缓存的语义，也不合并可能具有副作用的调用。
+        if tool.cache_ttl <= 0:
+            with measure_stage("rag_search"):
+                return await self._search_uncached(tool_name, query, top_k, context)
+        key = self._cache_key(cache_name, params, context=context)
+        with measure_stage("rag_search"):
+            async with self._search_locks.hold(key):
+                cached = self._get_cache(cache_name, params, context=context)
+                if cached is not None:
+                    record_event("rag_pipeline_cache_hit")
+                    data, reranked = cached
+                    return ToolResult(True, data, tool_name, cached=True, reranked=reranked)
+                record_event("rag_pipeline_cache_miss")
+                result = await self._search_uncached(tool_name, query, top_k, context)
+                if result.success and version == self._cache_versions.get(tool_name, 0):
+                    self._set_cache(cache_name, params, result.data, tool.cache_ttl,
+                                    reranked=result.reranked, context=context)
+                return result
+
+    async def _search_uncached(self, tool_name, query, top_k, context):
         # 1. 查询改写：生成多角度子查询
         sub_queries = await self.rewrite_query(query, n=3)
         logger.info(f"查询改写: {query!r} → {sub_queries}")
@@ -413,7 +444,8 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await asyncio.wait_for(self._client.messages.create(
+            resp = await asyncio.wait_for(create_message(self._client,
+                stage="rag.rerank",
                 model=self._model, max_tokens=2048, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             ), timeout=30)

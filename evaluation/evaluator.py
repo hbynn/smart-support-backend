@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import create_message, extract_text_content
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
 from evaluation.few_shot import JUDGE_FEW_SHOT_EXAMPLES, JUDGE_FEW_SHOT_VERSION
@@ -194,7 +194,8 @@ Agent 响应: {response}
         for attempt in range(1, 3):
             stop_reason = None
             try:
-                resp = await asyncio.wait_for(self._client.messages.create(
+                resp = await asyncio.wait_for(create_message(self._client,
+                    stage="evaluation.judge",
                     model=self._model, max_tokens=budget, temperature=0.0,
                     messages=[{"role": "user", "content": request_prompt}],
                 ), timeout=self._timeout)

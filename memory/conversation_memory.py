@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -28,7 +29,8 @@ import redis.asyncio as redis
 from redis.exceptions import WatchError
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import create_message, extract_text_content
+from core.performance import record_event
 from core.concurrency import KeyedLocks, redis_lease
 
 logger = logging.getLogger(__name__)
@@ -189,7 +191,7 @@ class MemoryManager:
     async def maintain(self, user_id, conv_id):
         # _compress 的快照与 WATCH 提交已保护一致性；生成摘要不占聊天锁。
         await asyncio.wait_for(self._compress(user_id, conv_id), 30)
-        await self.update_profile(user_id, conv_id)
+        await self.update_profile(user_id, conv_id, only_if_due=True)
 
     async def add_message(
         self,
@@ -223,12 +225,27 @@ class MemoryManager:
         if await self._redis.llen(key) >= self.COMPRESS_AT:
             await self._compress(user_id, conv_id)
 
-    async def update_profile(self, user_id: str, conv_id: str) -> None:
+    async def update_profile(self, user_id: str, conv_id: str, *, only_if_due: bool = False) -> None:
         digest = hashlib.sha256(self._safe_text(user_id).encode()).hexdigest()
         async with redis_lease(self._redis, f"lock:profile:{digest}"):
-            await self._update_profile(user_id, conv_id)
+            marker = f"profile_updated_v1:{digest}"
+            if only_if_due:
+                try:
+                    interval = max(0, float(os.getenv("PROFILE_UPDATE_MIN_INTERVAL_S", "60")))
+                    last = float(await self._redis.get(marker) or 0)
+                except (ValueError, TypeError):
+                    interval, last = 60, 0
+                if time.time() - last < interval:
+                    messages = await self._get_working_memory(user_id, conv_id)
+                    latest = next((m.content for m in reversed(messages) if m.role == MsgRole.USER), "")
+                    explicit_preference = re.search(r"请记住|以后.{0,8}(?:请|希望|优先)|我(?:更)?喜欢|我的偏好|\b(?:remember|prefer)\b", latest, re.I)
+                    if not explicit_preference:
+                        record_event("profile_update_throttled")
+                        return
+            if await self._update_profile(user_id, conv_id):
+                await self._redis.setex(marker, 86400, str(time.time()))
 
-    async def _update_profile(self, user_id: str, conv_id: str) -> None:
+    async def _update_profile(self, user_id: str, conv_id: str) -> bool:
         """
         从当前工作记忆中提炼用户偏好，更新用户画像。
         用 LLM 提炼偏好，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
@@ -237,7 +254,7 @@ class MemoryManager:
         conv_id = self._safe_text(conv_id)
         messages = await self._get_working_memory(user_id, conv_id)
         if not messages:
-            return
+            return False
 
         current_profile = await self._get_profile(user_id)
 
@@ -254,7 +271,8 @@ class MemoryManager:
         prompt = self._safe_text(prompt)
 
         try:
-            resp = await asyncio.wait_for(self._client.messages.create(
+            resp = await asyncio.wait_for(create_message(self._client,
+                stage="memory.profile",
                 model=self._model, max_tokens=512, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             ), timeout=15)
@@ -277,8 +295,10 @@ class MemoryManager:
                 }],
             )
             logger.info(f"用户画像已更新: {user_id}")
+            return True
         except Exception as ex:
             logger.warning(f"更新用户画像失败: {ex}")
+            return False
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 
@@ -342,7 +362,8 @@ class MemoryManager:
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in to_compress))
         prompt = self._safe_text(f"用 2-3 句话总结以下对话的关键信息：\n{text}")
         try:
-            resp = await self._client.messages.create(
+            resp = await create_message(self._client,
+                stage="memory.compress",
                 model=self._model, max_tokens=1024, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -563,7 +584,8 @@ class MemoryManager:
 """
         )
         try:
-            resp = await self._client.messages.create(
+            resp = await create_message(self._client,
+                stage="memory.merge_summary",
                 model=self._model,
                 max_tokens=256,
                 temperature=0.0,

@@ -330,7 +330,9 @@ class PerformanceMonitor:
 
     def summary(self) -> Dict[str, Any]:
         """返回当前监控摘要，供 API 层暴露。"""
+        from core.performance import llm_usage_summary
         return {
+            "llm_usage": llm_usage_summary(),
             "agent_stats":   self._orchestrator.get_stats(),
             "tool_stats":    self._tool_manager.get_stats(),
             "active_alerts": [asdict(a) for a in self._alerts if not a.resolved][-10:],

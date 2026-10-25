@@ -2,11 +2,14 @@
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import time
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class IntentEmbedding:
@@ -21,14 +24,25 @@ class IntentEmbedding:
         self.enabled = self.provider != 'local' and bool(self.key)
         self.retry_at = 0.0
         self.last_error = None
+        self.last_source = None
+        self.last_dimensions = None
+        self.fallback_reason = (
+            'configured_local' if self.provider == 'local'
+            else 'missing_api_key' if not self.key else None
+        )
         self.remote_templates = {}
         self.local_templates = {}
         self.lock = asyncio.Lock()
+        if self.provider == 'siliconflow' and not self.key:
+            logger.warning('在线意图向量未启用：缺少 SILICONFLOW_API_KEY，将使用本地 n-gram')
 
     def status(self):
         return {'configured_provider': self.provider, 'online_configured': self.enabled,
                 'model': self.MODEL if self.enabled else 'local-ngram-256',
-                'cooldown': time.monotonic() < self.retry_at, 'last_error': self.last_error}
+                'cooldown': time.monotonic() < self.retry_at, 'last_error': self.last_error,
+                'last_source': self.last_source, 'last_dimensions': self.last_dimensions,
+                'fallback_reason': self.fallback_reason,
+                'retry_after_s': round(max(0, self.retry_at - time.monotonic()), 1)}
 
     async def vectors(self, message, templates, local_embed):
         # 快照防止 learn 在远程请求期间改变模板顺序或数量。
@@ -59,6 +73,9 @@ class IntentEmbedding:
                             self.remote_templates.clear()
                             raise ValueError('query_dimension_mismatch')
                         self.last_error = None
+                        self.last_source = 'siliconflow/' + self.MODEL
+                        self.last_dimensions = len(query)
+                        self.fallback_reason = None
                         return groups, query, 'siliconflow/BAAI/bge-m3'
             except asyncio.CancelledError:
                 raise
@@ -66,9 +83,17 @@ class IntentEmbedding:
                 # 不记录异常全文，避免暴露请求内容或认证信息。
                 self.last_error = (f'http_{ex.response.status_code}' if isinstance(ex, httpx.HTTPStatusError) else type(ex).__name__)
                 self.retry_at = time.monotonic() + 60
+                logger.warning('在线意图向量调用失败，回退本地 n-gram，冷却 60 秒：%s', self.last_error)
         if fingerprint not in self.local_templates:
             self.local_templates = {fingerprint: {key: [local_embed(t) for t in group] for key, group in snapshot.items()}}
-        return self.local_templates[fingerprint], local_embed(message), 'local-ngram'
+        query = local_embed(message)
+        self.last_source = 'local-ngram'
+        self.last_dimensions = len(query)
+        self.fallback_reason = (
+            'configured_local' if self.provider == 'local'
+            else 'missing_api_key' if not self.key else self.last_error or 'cooldown'
+        )
+        return self.local_templates[fingerprint], query, 'local-ngram'
 
     async def _request(self, client, texts):
         response = await client.post(self.URL, headers={'Authorization': 'Bearer ' + self.key},

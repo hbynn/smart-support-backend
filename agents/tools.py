@@ -206,6 +206,7 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
             "query": query,
             "top_k": top_k,
             "results": result.data,
+            "cached": bool(getattr(result, "cached", False)),
             "reranked": bool(getattr(result, "reranked", False)),
         }
 

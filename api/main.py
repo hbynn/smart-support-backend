@@ -12,6 +12,7 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from contextlib import nullcontext
 from typing import Any, Dict, List, Literal, Optional
 
 
@@ -25,8 +26,9 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Query, R
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
+from core.performance import collect_performance, measure_stage, performance_snapshot
 
-load_dotenv()
+load_dotenv(pathlib.Path(_ROOT) / '.env')
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
@@ -275,7 +277,8 @@ async def access_control(request: HTTPRequest, call_next):
     started = time.monotonic()
     if is_chat and _monitor is not None and "requests_total" in _monitor._prom:
         _monitor._prom["requests_total"].inc()
-    response = await call_next(request)
+    with collect_performance() if is_chat else nullcontext():
+        response = await call_next(request)
     if is_chat:
         elapsed = (time.monotonic() - started) * 1000
         response.headers["Server-Timing"] = f"chat;dur={elapsed:.1f}"
@@ -315,6 +318,7 @@ class ChatResponse(BaseModel):
     status: Literal["success", "partial", "failed"] = "success"
     retryable: bool = False
     error_code: Optional[str] = None
+    performance: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolTraceResponse(BaseModel):
@@ -389,7 +393,8 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
                 if previous.status != "failed" or not previous.retryable:
                     return render(previous)
             # 1. 读取记忆上下文
-            mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
+            with measure_stage("memory_read"):
+                mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
             # 2. 构建编排请求（含对话历史，用于意图识别上下文）
             history = [
@@ -397,7 +402,8 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
                 for m in mem_ctx.recent_messages[-5:]
             ] if mem_ctx.recent_messages else None
 
-            intent_result = await _orchestrator.recognize_intent(req.message, history=history)
+            with measure_stage("intent"):
+                intent_result = await _orchestrator.recognize_intent(req.message, history=history)
             full_context = mem_ctx.to_prompt_text()
 
             orch_req = OrcReq(
@@ -425,7 +431,8 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
             orch_req.before_unsafe_tool = before_unsafe_tool
 
             # 3. 执行
-            result = await _orchestrator.run(orch_req)
+            with measure_stage("agent_execution"):
+                result = await _orchestrator.run(orch_req)
 
             response = ChatResponse(
                 conv_id=conv_id,
@@ -450,6 +457,7 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
                 status=result.status,
                 retryable=result.retryable,
                 error_code=result.error_code,
+                performance=performance_snapshot(),
             )
             await _memory.commit_turn(req.user_id, conv_id, client_id, req.message, response.model_dump(),
                                       _orchestrator.get_tool_trace(result.request_id), state=orch_req.conversation_state)
@@ -507,7 +515,7 @@ async def search(query: str = Query(min_length=1, max_length=2000), top_k: int =
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
     result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
-    return {"query": query, "results": result.data, "reranked": result.reranked}
+    return {"query": query, "results": result.data, "reranked": result.reranked, "cached": result.cached}
 
 
 class DocInput(BaseModel):
@@ -733,7 +741,20 @@ class MCPCallInput(BaseModel):
 async def embedding_status():
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
-    return _orchestrator._intent_recognizer._embedding.status()
+    recognizer = _orchestrator._intent_recognizer
+    return {**recognizer._embedding.status(), 'branch_enabled': recognizer._embedding_enabled}
+
+
+class EmbeddingCheckInput(BaseModel):
+    message: str = Field(default='这笔钱能退给我吗？', min_length=1, max_length=2000)
+
+
+@app.post('/integrations/embedding/check', tags=['Embedding'])
+async def embedding_check(req: EmbeddingCheckInput):
+    """仅运行意图向量分支，验证模板和问题的实际来源，不调用聊天模型。"""
+    if _orchestrator is None:
+        raise HTTPException(503, '服务未就绪')
+    return await _orchestrator._intent_recognizer.check_embedding(req.message)
 
 
 @app.get("/integrations/mcp", tags=["MCP"])

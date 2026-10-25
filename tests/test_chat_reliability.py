@@ -75,6 +75,18 @@ def body(message="退款规则", request_id="one", conv_id="c"):
 
 
 @pytest.mark.asyncio
+async def test_chat_reports_stage_timings_and_provider_usage_without_changing_replay(services):
+    memory, orch, client, http = services
+    client.messages.create.return_value = SimpleNamespace(content=[{"type":"text", "text":"回复完成"}],
+        stop_reason="end_turn", usage=SimpleNamespace(input_tokens=15, output_tokens=8))
+    first = await http.post("/chat", json=body())
+    perf = first.json()["performance"]
+    assert {"memory_read", "intent", "agent_execution"} <= set(perf["stages_ms"])
+    assert perf["llm"]["calls"] == 1 and perf["llm"]["output_tokens"] == 8
+    assert first.json() == (await http.post("/chat", json=body())).json()
+
+
+@pytest.mark.asyncio
 async def test_failed_turn_can_retry_after_recovery_without_duplicate_history(services):
     memory, orch, model, http = services
     model.messages.create.side_effect = RuntimeError("provider down")

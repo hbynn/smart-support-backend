@@ -414,7 +414,7 @@ async def recognize(self, message: str, history=None) -> IntentResult:
 
 - **LLM Few\-shot**（`_llm_recognize`）：用每个意图类别取 1 条模板样本拼成 Few\-shot 示例，再加上最近 3 轮对话作为上下文，让 LLM 返回 JSON 格式的 `{"intent", "confidence", "reasoning"}`。Prompt 里特别强调"如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类"——这是为了让 LLM 主动倾向细粒度分类。
 
-- **Embedding 相似度**（`_embedding_recognize`）：先懒加载所有模板的向量（`_load_template_embeddings`，只在首次调用时执行且带缓存），再算用户消息向量和各类模板向量的余弦相似度，取最高分类别。**注意：****`_embed_text()`**** 会优先尝试调用 ****`self.client.embeddings.create(model="voyage-3-lite", ...)`****，但当前 Anthropic SDK 没有暴露 ****`embeddings`**** 资源，所以实际总是走 ****`_local_embedding()`**** 的字符 n\-gram 哈希向量兜底方案**——这是一个重要的真实实现细节，不是走了真正的语义向量模型，而是用 1/2/3\-gram 字符哈希构造 256 维向量做近似匹配。
+- **Embedding 相似度**（`_embedding_recognize`）：通过 `core/intent_embedding.py` 的独立 HTTP 客户端调用硅基流动 `BAAI/bge-m3`，先生成并缓存各类模板向量，再计算问题向量与模板向量的余弦相似度。在线配置读取 `SILICONFLOW_API_KEY`，与聊天客户端和 `ANTHROPIC_API_KEY` 独立；当前不使用 Voyage，也不调用 `AsyncAnthropic.embeddings`。未配置、选择本地或在线失败时，问题和模板一起回退到 256 维字符 n-gram 哈希向量。通过 `POST /integrations/embedding/check` 或 `python scripts/check_embedding.py` 可独立验证实际来源，详见 [在线配置](../README.md#intent-embedding-setup)。`INTENT_EMBEDDING_ENABLED=false` 才会关闭整个向量分支。
 
 - **Pattern 规则匹配**（`_pattern_recognize`）：先匹配细粒度关键词字典（比如"退款/退货" → `REFUND`，"401/验证码" → `TECHNICAL_LOGIN`），如果没命中再匹配粗粒度关键词字典（比如"投诉/经理" → `ESCALATION`）。打分公式是 `min(1.0, 0.5 + 0.25 * (hits - 1))`——单个关键词命中给 0\.5 分，每多命中一个关键词加 0\.25 分。
 

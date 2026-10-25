@@ -119,6 +119,8 @@ SILICONFLOW_API_KEY=
 
 模型名必须是所选平台实际提供、账号可调用的 ID；示例文件中的值不保证适用于所有账号。使用 Anthropic 官方服务时可留空 `ANTHROPIC_BASE_URL`，并填写对应的模型名和 Key。只有 OpenAI Chat Completions 接口的服务，不能直接填到这里使用。
 
+连接 `api.deepseek.com` 时，公共 LLM 调用层会显式关闭默认思考模式，覆盖意图分类、Agent 与汇总回复、查询改写、重排、画像、摘要和评测。这样可避免思考占满短输出预算而没有生成 JSON 或正文；其他模型服务保持原有请求参数。回复真正达到输出上限时仍会标记为 `partial`，不会伪装成完整成功。
+
 ### 3. 启动后端及依赖
 
 ```bash
@@ -187,7 +189,9 @@ docker compose --env-file ../EchoMind/.env up -d --build
 | `CHROMA_PERSIST_DIRECTORY` | development 无法连接远端 ChromaDB 时的本地存储路径；容器内为 `/app/data/chroma`。production 连接失败时中止启动。 |
 | `ECHOMIND_SEED_DEMO_DOCS` | development 空库是否自动导入示例政策，默认 `true`；production 始终禁止自动导入。 |
 | `ECHOMIND_INTENT_TIMEOUT_S` / `ECHOMIND_LLM_TIMEOUT_S` / `ECHOMIND_COMPOSER_TIMEOUT_S` | 意图识别、Agent 每次模型请求和汇总模型请求的超时，默认 8 / 15 / 8 秒；均受聊天 50 秒总预算限制。 |
+| `PROFILE_UPDATE_MIN_INTERVAL_S` | 普通后台画像最短更新间隔，默认 60 秒；明确表达偏好时立即更新。设为 0 恢复逐轮更新。会话消息和业务字段仍每轮保存。 |
 | `LOG_LEVEL` | 日志级别，默认 `INFO`。 |
+| `INTENT_EMBEDDING_ENABLED` | 是否执行向量分支，默认 `true`；设为 `false` 后仅融合 LLM 和规则。 |
 | `INTENT_EMBEDDING_PROVIDER` | `auto`、`local` 或 `siliconflow`，默认 `auto`，见下一节。 |
 | `SILICONFLOW_API_KEY` | 可选，在线意图向量使用的独立 Key。 |
 | `MCP_EXTERNAL_ENABLED` | 默认 `true`；设为 `false` 关闭外部 MCP 客户端。 |
@@ -239,7 +243,8 @@ docker compose --env-file ../EchoMind/.env up -d --build --force-recreate echomi
 3. 在 **EchoMind/.env** 中填写：
 
 ```dotenv
-INTENT_EMBEDDING_PROVIDER=auto
+INTENT_EMBEDDING_ENABLED=true
+INTENT_EMBEDDING_PROVIDER=siliconflow
 SILICONFLOW_API_KEY=替换为你自己的硅基流动Key
 ```
 
@@ -275,10 +280,32 @@ docker compose up -d --force-recreate echomind
 }
 ```
 
-`online_configured=true` 只表示已读取 Key。接着通过 `/chat` 发送一条新问题，例如“登录时提示 401，应该怎么处理？”，查看响应里的 `intent_embedding_source`：
+`online_configured=true` 只表示已读取 Key。使用独立检查接口验证模板向量和问题向量，不需要聊天模型余额：
+
+```bash
+curl -X POST http://localhost:8000/integrations/embedding/check \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"这笔钱能退给我吗？"}'
+```
+
+只有实际使用在线模型时，结果中的 `success` 才为 `true`。`source` 显示实际向量来源，`status.last_dimensions` 显示维度；本地降级时，`status.fallback_reason` 区分 `missing_api_key`、`configured_local`、`http_401`、`http_429`、`TimeoutError` 等原因。`status.retry_after_s` 表示距离下一次允许在线重试的秒数。状态不包含 API Key。
+
+本地脚本可独立检查，脚本会读取项目根目录 `.env`，环境中已设置的变量优先：
+
+```bash
+.venv/bin/python scripts/check_embedding.py --message '这笔钱能退给我吗？'
+# 或在运行中的容器执行
+docker compose exec -T echomind python scripts/check_embedding.py
+```
+
+本地脚本使用 Python 3.12 并安装项目依赖。在线检查成功退出码为 `0`，本地降级或分支关闭时为 `1`，便于在批量评测之前阻止误用本地向量。自己编写测试脚本时，同样需要在创建 `IntentRecognizer` 前加载 `.env`。
+
+接着通过 `/chat` 发送一条新问题，例如“登录时提示 401，应该怎么处理？”，查看响应里的 `intent_embedding_source`：
 
 - `siliconflow/BAAI/bge-m3`：本次匹配实际使用了在线向量。
 - `local-ngram`：本次使用本地向量，可能是未配置、主动关闭或调用失败后降级。
+- `disabled`：`INTENT_EMBEDDING_ENABLED=false`，没有执行向量分支；使用 LLM 0.85、规则 0.15 的权重。`provider=local` 仍执行向量分支，使用默认三路权重。
+- `unavailable`：向量分支异常，未得到匹配结果。
 
 启用鉴权后，状态接口需要管理员访问 Token，聊天接口可使用用户访问 Token。完整聊天还需要有效的 LLM 配置。
 
@@ -315,9 +342,16 @@ docker compose up -d --force-recreate echomind
 | `primary_agent`、`supporting_agents`、`routing_reason` | 了解主辅 Agent 的选择和路由依据。 |
 | `tools_used`、`knowledge_used` | 查看工具使用情况；后者仅在知识库工具实际成功时为 true。 |
 | `intent_embedding_source` | 确认本次向量分支使用在线模型还是本地 n-gram。 |
+| `performance` | 本轮记忆读取、意图和 Agent 执行耗时，以及模型逻辑调用数、供应商返回的 token 用量和检索缓存事件；不包含问题正文。 |
 | `status` | `success` 为完整回复，`partial` 表示回复截断或仅部分 Agent 成功，`failed` 为执行失败。 |
 | `retryable`、`error_code` | 执行失败返回 HTTP 503；仅 `retryable=true` 时可以复用请求 ID 重新执行。 |
 | `latency_ms` | 从进入聊天处理、等待会话锁到生成回复的耗时；完整 HTTP 耗时（含存储提交）见 `Server-Timing` 响应头。 |
+
+检索会缓存“查询改写 → 召回 → 重排”的完整结果，并合并并发的相同检索。缓存按查询、Top-K、工具版本和传入的用户上下文隔离，沿用工具的 TTL；知识库更新会使线上及评测缓存失效。工具 TTL 为 0 时关闭完整流程缓存和并发合并，失败检索不缓存。`/search` 和知识库工具结果的 `cached` 表示完整流程命中，此时不再请求改写或重排模型。
+
+默认回复提示约 200–400 个中文字符，多角色汇总约 300–500 个字符，保留必要依据、核验条件和下一步；用户明确要求详细说明时允许展开。这是生成时的篇幅指导，不是返回后裁剪，实际达到模型输出上限时仍返回 `partial`。结构化实体优先随角色输入包提供，避免在同一次模型请求中重复发送。
+
+`performance.stages_ms` 是到生成回复为止的阶段耗时，嵌套阶段不可直接相加；`performance.llm.latency_ms` 是各次模型调用耗时之和，并行时可能大于实际墙钟时间。持久化提交在这些阶段之后，完整 HTTP 耗时仍以 `Server-Timing` 为准。幂等回放保留原响应中的统计。`/monitor` 的 `llm_usage.by_stage` 统计本进程各阶段用量，包括后台画像；进程重启后重新累计。调用数按 SDK 逻辑调用计算，不展开 SDK 内部重试；token 字段原样采用供应商统计口径，未报告的调用通过 `usage_reported_calls` 区分，不据此推算账单金额。
 
 聊天总超时为 50 秒。同一会话串行处理，不同会话可并行；用户和助手消息一起写入 Redis。后台记忆压缩与画像更新不阻塞回复返回。
 
