@@ -204,7 +204,9 @@ class OrchestratorResult:
     response:    str
     agent_type:  AgentType
     intent:      Optional[IntentCategory]
-    escalated:   bool  = False
+    escalated:   bool  = False  # 需要升级，不表示已接通人工
+    urgency: Optional[str] = None
+    escalation_reason: Optional[str] = None
     latency_ms:  float = 0.0
     agent_types: List[AgentType] = field(default_factory=list)
     primary_agent: Optional[AgentType] = None
@@ -837,6 +839,8 @@ class AgentOrchestrator:
             "tools_used": list(result.tools_used),
             "tool_calls": list(result.tool_traces),
             "escalated": result.escalated,
+            "urgency": result.urgency,
+            "escalation_reason": result.escalation_reason,
             "latency_ms": round(result.latency_ms, 1),
             "status": result.status,
             "retryable": result.retryable,
@@ -886,7 +890,9 @@ class AgentOrchestrator:
                 response="我还不能确定您要处理的是哪类问题。请补充一下是订单物流、退款账单、账户资料，还是技术故障？",
                 agent_type=AgentType.GENERAL,
                 intent=req.intent,
-                escalated=False,
+                escalated=bool(self._escalation_reason(req)),
+                urgency=req.urgency.name if req.urgency else None,
+                escalation_reason=self._escalation_reason(req),
                 latency_ms=(time.monotonic() - t0) * 1000,
                 agent_types=[AgentType.GENERAL],
                 primary_agent=AgentType.GENERAL,
@@ -904,15 +910,9 @@ class AgentOrchestrator:
         # 2. 执行主 Agent（含降级）
         response = await self._execute(req, decision.primary_agent)
 
-        # 4. 升级检查
-        escalated = False
-        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent in (
-            IntentCategory.ESCALATION,
-            IntentCategory.HUMAN_HANDOFF,
-        ):
-            escalated = True
-            logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
-            # 生产环境：此处创建工单、通知人工客服
+        # 升级需求独立于领域选择；不替换专业回答，也不宣称已完成人工交接。
+        escalation_reason = self._escalation_reason(req, [response])
+        escalated = bool(escalation_reason)
 
         result = OrchestratorResult(
             request_id=req.request_id,
@@ -920,6 +920,8 @@ class AgentOrchestrator:
             agent_type=response.agent_type,
             intent=req.intent,
             escalated=escalated,
+            urgency=req.urgency.name if req.urgency else None,
+            escalation_reason=escalation_reason,
             latency_ms=(time.monotonic() - t0) * 1000,
             agent_types=[response.agent_type],
             primary_agent=decision.primary_agent,
@@ -949,7 +951,8 @@ class AgentOrchestrator:
         composed = await self._composer.compose_result(req, valid_responses)
         if len(valid_responses) != len(responses) and composed.status == "success":
             composed.status = "partial"
-        escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
+        escalation_reason = self._escalation_reason(req, valid_responses)
+        escalated = bool(escalation_reason)
         tools_used = list(dict.fromkeys(
             tool_name
             for response in valid_responses
@@ -966,6 +969,8 @@ class AgentOrchestrator:
             agent_type=decision.primary_agent,
             intent=req.intent,
             escalated=escalated,
+            urgency=req.urgency.name if req.urgency else None,
+            escalation_reason=escalation_reason,
             latency_ms=(time.monotonic() - t0) * 1000,
             agent_types=[
                 r.agent_type for r in responses
@@ -986,16 +991,24 @@ class AgentOrchestrator:
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _escalation_reason(req: Request, responses=()) -> Optional[str]:
+        """升级需求策略；与领域路由解耦。人工接入由调用方负责。"""
+        if req.intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
+            return "explicit_handoff"
+        if req.urgency == UrgencyLevel.CRITICAL:
+            return "critical_urgency"
+        if any(response.escalate for response in responses):
+            return "agent_requested"
+        return None
+
     def _route(self, intent: Optional[IntentCategory], urgency: Optional[UrgencyLevel]) -> AgentType:
         """
         三层路由决策：
           1. 意图映射
-          2. 紧急度覆盖（CRITICAL 直接升级）
+          2. 紧急度独立处理，不覆盖领域
           3. 默认 GENERAL
         """
-        if urgency == UrgencyLevel.CRITICAL:
-            return AgentType.ESCALATION
-
         if intent and intent in self._INTENT_ROUTING:
             target = self._INTENT_ROUTING[intent]
             # 如果目标类型有可用实例则使用，否则降级
@@ -1008,16 +1021,9 @@ class AgentOrchestrator:
         """
         结构化路由决策。
 
-        先处理紧急/转人工，再用领域分数决定主 Agent 和辅助 Agent。
+        先处理明确升级/转人工诉求，再用领域分数决定主 Agent 和辅助 Agent。
         这样可以表达“主处理 + 辅助诊断”，避免关键词命中后无主次地拼接。
         """
-        if req.urgency == UrgencyLevel.CRITICAL:
-            return RoutingDecision(
-                primary_agent=AgentType.ESCALATION,
-                reason="紧急度为 CRITICAL，触发升级路由",
-                confidence=1.0,
-            )
-
         if req.intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
             return RoutingDecision(
                 primary_agent=AgentType.ESCALATION,

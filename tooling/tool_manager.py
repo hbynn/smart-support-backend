@@ -413,6 +413,18 @@ class MCPToolManager:
 
         # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
         data, reranked = await self._rerank_with_status(query, merged, top_k)
+        if tool_name == "knowledge_search":
+            expanded, seen = [], set()
+            for item in data:
+                if isinstance(item, dict) and "evidence" in item:
+                    identity = (item.get("parent_id"), item["evidence"])
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    item = dict(item)
+                    item["content"] = item.pop("evidence")
+                expanded.append(item)
+            data = expanded
         return ToolResult(success=True, data=data, tool_name=tool_name, reranked=reranked)
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────

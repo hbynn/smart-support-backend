@@ -87,6 +87,7 @@ services:
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
+      - ./data/support:/app/data/support
       - ./skills:/app/skills
       - ./config/mcp_servers.json:/app/config/mcp_servers.json:ro
       - ./logs:/app/logs

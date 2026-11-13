@@ -213,7 +213,7 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
     return {
         "search_knowledge_base": make_tool(
             "search_knowledge_base",
-            "检索知识库并返回最相关的文档片段；可用于通用、技术、账单和升级场景。",
+            "检索业务知识。回答政策问题时同时核对例外，并注明结果中的文档标题和条款；证据不足时请说明。",
             {
                 "query": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "用户问题或检索关键词"},
                 "top_k": {"type": "integer", "minimum": 1, "maximum": 20, "description": "返回结果条数"},

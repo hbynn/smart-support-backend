@@ -24,7 +24,6 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-import chromadb
 import redis.asyncio as redis
 from redis.exceptions import WatchError
 from anthropic import AsyncAnthropic
@@ -103,6 +102,8 @@ class MemoryManager:
         base_url:     Optional[str] = None,
         model:        str = "claude-3-5-sonnet-20241022",
     ):
+        import chromadb
+
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
@@ -154,6 +155,13 @@ class MemoryManager:
         raw = await self._redis.get(self.receipt_key(user_id, conv_id, request_id))
         return json.loads(raw) if raw else None
 
+    @staticmethod
+    def _explicit_style(message):
+        """只识别完整、明确的长期偏好声明，避免把转述和临时要求写入画像。"""
+        import re
+        match = re.fullmatch(r"(?:以后|今后|之后)(?:请|都|请都)?(?:给我)?(简短回答|简洁回答|详细解释|详细回答|先说结论)[。！! ]*", message.strip())
+        return match.group(1) if match else None
+
     async def commit_turn(self, user_id, conv_id, request_id, message, response, trace=None, *, state=None):
         """原子保存一整轮及响应回执；由 conversation 锁保护。"""
         await self._migrate_legacy_keys(user_id, conv_id)
@@ -165,6 +173,12 @@ class MemoryManager:
             if response.get("status") != "failed":
                 pipe.lpush(key, raw("user", message), raw("assistant", response["response"]))
                 pipe.expire(key, 86400)
+                style = self._explicit_style(message)
+                if style:
+                    fact = {"value": style, "conv_id": conv_id, "request_id": request_id,
+                            "quote": message, "updated_at": datetime.now().isoformat()}
+                    pipe.set("explicit_style:" + self._profile_doc_id(user_id),
+                             json.dumps(fact, ensure_ascii=False))
                 if state is not None:
                     pipe.setex(self._state_key(user_id, conv_id), 86400, json.dumps(state))
             pipe.setex(self.receipt_key(user_id, conv_id, request_id), 86400,
@@ -324,6 +338,10 @@ class MemoryManager:
 
         # 3. 用户画像
         profile = await self._get_profile(user_id)
+
+        style = await self._redis.get("explicit_style:" + self._profile_doc_id(user_id))
+        if style:
+            profile = dict(profile, explicit_reply_style=json.loads(style)["value"])
 
         # 4. 会话摘要（如果已压缩过）
         summary = await self._redis.get(self._summary_key(user_id, conv_id)) or ""

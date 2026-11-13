@@ -70,3 +70,32 @@ def test_long_unpunctuated_text_respects_chunk_size():
     chunks = kb._chunk_text('长' * 1201, chunk_size=500)
     assert [len(c) for c in chunks] == [500, 500, 201]
     assert ''.join(chunks) == '长' * 1201
+
+class SearchCollection(FakeCollection):
+    def count(self):
+        return len(self.rows)
+
+    def get(self, where=None, include=None):
+        if where is not None:
+            return super().get(where, include)
+        return {"ids": list(self.rows), "documents": [d for d, _ in self.rows.values()],
+                "metadatas": [m for _, m in self.rows.values()]}
+
+    def query(self, query_texts, n_results, include):
+        # 故意让向量召回把近似错误码排在正确错误码之前。
+        keys = list(self.rows)[:n_results]
+        return {"ids": [keys], "documents": [[self.rows[k][0] for k in keys]],
+                "metadatas": [[self.rows[k][1] for k in keys]]}
+
+
+def test_hybrid_exact_code_parent_exception_and_replacement():
+    kb = make_kb()
+    kb._collection = SearchCollection()
+    kb.add_documents([{"title": "其他", "content": "E1025 网络故障"},
+                      {"title": "售后", "content": "第十二条 退货\nE1024 处理方式。" +
+                       "普通商品可以退。" * 85 + "\n例外：活动商品不适用。"}])
+    hit = kb.search("E1024", 1)[0]
+    assert hit["section"] == "第十二条 退货"
+    assert "例外：活动商品不适用。" in hit["evidence"]
+    kb.add_documents([{"title": "售后", "content": "第十三条 更新后的政策"}])
+    assert all("第十二条" not in r["evidence"] for r in kb.search("E1024", 5))

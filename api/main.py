@@ -1,5 +1,5 @@
 """
-EchoMind 智能客服系统 — FastAPI 入口
+智能客服工单平台 — FastAPI 入口
 
 启动时打印小熊饼干图案。
 所有核心组件在 lifespan 中初始化，通过环境变量配置。
@@ -39,13 +39,15 @@ logger = logging.getLogger(__name__)
 BANNER = r"""
     ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
    ╔══════════════════════╗
-   ║   EchoMind  v2.0     ║
+   ║   智能客服工单平台  v2.0     ║
    ║   智能客服 AI 系统    ║
    ╚══════════════════════╝
     ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
 """
 
 # ── 全局组件（lifespan 中初始化）─────────────────────────────────────────────
+_support_repository = None
+_ticket_workflow = None
 _orchestrator = None
 _memory       = None
 _tool_manager = None
@@ -168,6 +170,27 @@ async def lifespan(app: FastAPI):
     ))
     from tooling.mcp_client import StandardMCPClient, load_servers
     from tooling.mcp_server import configure
+    global _support_repository, _ticket_workflow
+    from domain.repository import SupportRepository
+    from tooling.support_tools import SupportTools, register_support_tools
+    from workflow.ticket_workflow import TicketWorkflow
+
+    support_db_path = os.getenv(
+        "SUPPORT_DB_PATH",
+        str(pathlib.Path(_ROOT) / "data" / "support" / "echomind.db"),
+    )
+    _support_repository = SupportRepository(support_db_path)
+    await _support_repository.initialize()
+    support_tools = SupportTools(_support_repository)
+    support_manager = _tool_manager.fork()
+    register_support_tools(support_manager, support_tools)
+    _ticket_workflow = TicketWorkflow(
+        _support_repository,
+        support_manager,
+        approval_threshold=float(os.getenv("REFUND_APPROVAL_THRESHOLD", "100")),
+    )
+    logger.info("售后工单工作流已初始化: %s", support_db_path)
+
     configure(kb, _tool_manager)
     mcp_config = pathlib.Path(os.getenv("MCP_SERVERS_CONFIG", str(pathlib.Path(_ROOT) / "config/mcp_servers.json")))
     enabled = os.getenv("MCP_EXTERNAL_ENABLED", "true").lower() in {"1", "true", "yes"}
@@ -203,7 +226,7 @@ async def lifespan(app: FastAPI):
     from core.concurrency import ProfileUpdater
     _profile_updater = ProfileUpdater(_memory, workers=int(os.getenv("PROFILE_UPDATE_WORKERS", "4")))
     _profile_updater.start()
-    logger.info("EchoMind 已就绪")
+    logger.info("智能客服工单平台 已就绪")
     async with standard_mcp_server.session_manager.run():
         try:
             yield
@@ -215,7 +238,7 @@ async def lifespan(app: FastAPI):
             if _memory is not None:
                 await _memory.close()
             configure(None)
-            logger.info("EchoMind 已关闭")
+            logger.info("智能客服工单平台 已关闭")
 
 
 def _refresh_agent_tools():
@@ -244,7 +267,7 @@ from tooling.mcp_server import http_app as standard_mcp_app, server as standard_
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="EchoMind 智能客服",
+    title="智能客服工单平台",
     version="2.0.0",
     lifespan=lifespan,
     docs_url="/docs",
@@ -309,6 +332,8 @@ class ChatResponse(BaseModel):
     routing_reason: str = ""
     routing_confidence: float = 0.0
     escalated:   bool
+    urgency: Optional[str] = None
+    escalation_reason: Optional[str] = None
     latency_ms:  float
     knowledge_used: bool = False
     entities: Dict[str, List[str]] = Field(default_factory=dict)
@@ -332,6 +357,152 @@ class RecentToolTracesResponse(BaseModel):
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
+class TicketCreateRequest(BaseModel):
+    """创建退款工单；order_id 和 amount 可由消息提取。"""
+    user_id: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    source_conv_id: Optional[str] = Field(default=None, min_length=1)
+    source_request_id: Optional[str] = Field(default=None, min_length=1)
+    order_id: Optional[str] = None
+    amount: Optional[float] = Field(default=None, gt=0)
+    reason: str = ""
+
+
+class TicketDetailsRequest(BaseModel):
+    """为 COLLECTING_INFO 工单补充订单信息。"""
+    actor: str = Field(default="user", min_length=1)
+    order_id: str = Field(min_length=1)
+    amount: Optional[float] = Field(default=None, gt=0)
+    reason: Optional[str] = None
+
+
+class TicketActorRequest(BaseModel):
+    actor: str = Field(default="operator", min_length=1)
+
+
+class TicketRejectRequest(TicketActorRequest):
+    reason: str = Field(default="人工审核拒绝", min_length=1)
+
+
+def _require_ticket_workflow():
+    if _ticket_workflow is None:
+        raise HTTPException(503, "售后工单服务未就绪")
+    return _ticket_workflow
+
+
+@app.post("/tickets", tags=["售后工单"])
+async def create_ticket(body: TicketCreateRequest):
+    """创建退款工单；重复的用户/订单/金额组合返回已有工单。"""
+    workflow = _require_ticket_workflow()
+    if bool(body.source_conv_id) != bool(body.source_request_id):
+        raise HTTPException(422, "会话 ID 与客户端请求 ID 需要同时提供")
+    if body.source_conv_id:
+        receipt = await _memory.get_turn_receipt(body.user_id, body.source_conv_id, body.source_request_id)
+        if not receipt:
+            raise HTTPException(400, "找不到该用户的来源对话回执")
+    ticket = await workflow.create_ticket(
+        user_id=body.user_id,
+        message=body.message,
+        order_id=body.order_id,
+        amount=body.amount,
+        reason=body.reason,
+    )
+    if body.source_conv_id:
+        await _support_repository.link_ticket(body.user_id, body.source_conv_id, body.source_request_id, ticket.ticket_id)
+    return ticket.to_dict()
+
+
+@app.get("/tickets/{ticket_id}", tags=["售后工单"])
+async def get_ticket(ticket_id: str):
+    workflow = _require_ticket_workflow()
+    try:
+        return (await workflow.get_ticket(ticket_id)).to_dict()
+    except Exception as ex:
+        from workflow.ticket_workflow import TicketNotFound
+        if isinstance(ex, TicketNotFound):
+            raise HTTPException(404, str(ex)) from ex
+        raise
+
+
+@app.post("/tickets/{ticket_id}/details", tags=["售后工单"])
+async def supply_ticket_details(ticket_id: str, body: TicketDetailsRequest):
+    workflow = _require_ticket_workflow()
+    try:
+        ticket = await workflow.supply_details(
+            ticket_id,
+            actor=body.actor,
+            order_id=body.order_id,
+            amount=body.amount,
+            reason=body.reason,
+        )
+        return ticket.to_dict()
+    except Exception as ex:
+        return _raise_ticket_http_error(ex)
+
+
+@app.post("/tickets/{ticket_id}/approve", tags=["售后工单"])
+async def approve_ticket(ticket_id: str, body: TicketActorRequest):
+    workflow = _require_ticket_workflow()
+    try:
+        return (await workflow.approve(ticket_id, actor=body.actor)).to_dict()
+    except Exception as ex:
+        return _raise_ticket_http_error(ex)
+
+
+@app.post("/tickets/{ticket_id}/reject", tags=["售后工单"])
+async def reject_ticket(ticket_id: str, body: TicketRejectRequest):
+    workflow = _require_ticket_workflow()
+    try:
+        return (
+            await workflow.reject(ticket_id, actor=body.actor, reason=body.reason)
+        ).to_dict()
+    except Exception as ex:
+        return _raise_ticket_http_error(ex)
+
+
+@app.post("/tickets/{ticket_id}/retry", tags=["售后工单"])
+async def retry_ticket(ticket_id: str, body: TicketActorRequest):
+    workflow = _require_ticket_workflow()
+    try:
+        return (await workflow.retry(ticket_id, actor=body.actor)).to_dict()
+    except Exception as ex:
+        return _raise_ticket_http_error(ex)
+
+
+@app.get("/tickets/{ticket_id}/audit", tags=["售后工单"])
+async def ticket_audit(ticket_id: str):
+    workflow = _require_ticket_workflow()
+    try:
+        return {"ticket_id": ticket_id, "events": await workflow.get_audit(ticket_id)}
+    except Exception as ex:
+        return _raise_ticket_http_error(ex)
+
+
+@app.get("/orders/{order_id}", tags=["售后工单"])
+async def get_demo_order(order_id: str, user_id: str):
+    """查看演示订单；实际项目中应由独立订单服务提供。"""
+    if _support_repository is None:
+        raise HTTPException(503, "订单服务未就绪")
+    order = await _support_repository.get_order(order_id)
+    if order is None or order.user_id != user_id:
+        raise HTTPException(404, "订单不存在")
+    return order.to_dict()
+
+
+def _raise_ticket_http_error(ex: Exception):
+    """把工作流异常映射为稳定的HTTP语义。"""
+    from domain.repository import ConcurrencyError
+    from workflow.ticket_workflow import InvalidTransition, TicketNotFound
+
+    if isinstance(ex, TicketNotFound):
+        raise HTTPException(404, str(ex)) from ex
+    if isinstance(ex, (InvalidTransition, ConcurrencyError)):
+        raise HTTPException(409, str(ex)) from ex
+    if isinstance(ex, (ValueError, PermissionError)):
+        raise HTTPException(400, str(ex)) from ex
+    raise ex
+
+
 @app.get("/health")
 async def health():
     if _orchestrator is None:
@@ -392,6 +563,19 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
                 previous = ChatResponse(**receipt["response"])
                 if previous.status != "failed" or not previous.retryable:
                     return render(previous)
+            from workflow.ticket_lookup import status_answer
+            if _support_repository is not None:
+                lookup = await status_answer(_support_repository, req.user_id, conv_id, req.message)
+                if lookup is not None:
+                    answer, ticket_id = lookup
+                    if ticket_id:
+                        await _support_repository.link_ticket(req.user_id, conv_id, client_id, ticket_id)
+                    response = ChatResponse(conv_id=conv_id, request_id=client_id, response=answer,
+                        intent="refund", intent_group="billing", agent_type="billing", primary_agent="billing",
+                        tools_used=["get_my_ticket_status"], escalated=False,
+                        latency_ms=round((time.monotonic() - started) * 1000, 1))
+                    await _memory.commit_turn(req.user_id, conv_id, client_id, req.message, response.model_dump())
+                    return response
             # 1. 读取记忆上下文
             with measure_stage("memory_read"):
                 mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
@@ -448,6 +632,8 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
                 routing_reason=result.routing_reason,
                 routing_confidence=result.routing_confidence,
                 escalated=result.escalated,
+                urgency=result.urgency,
+                escalation_reason=result.escalation_reason,
                 latency_ms=round((time.monotonic() - started) * 1000, 1),
                 knowledge_used=any(t.get("tool_name") == "search_knowledge_base" and t.get("result_success") is True for t in result.tool_traces),
                 entities=orch_req.entities,
@@ -783,7 +969,7 @@ app.mount("/mcp", standard_mcp_app)
 # ── 交互式 CLI ────────────────────────────────────────────────────────────────
 async def _cli():
     print(BANNER)
-    print("EchoMind CLI — 输入 quit 退出\n")
+    print("智能客服工单平台 CLI — 输入 quit 退出\n")
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from memory.conversation_memory import MemoryManager, MsgRole
@@ -859,7 +1045,7 @@ async def _cli():
             await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
             await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
-            print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
+            print(f"\n智能客服工单平台 [{result.agent_type.value}]: {result.response}\n")
     finally:
         await bridge.close()
         await manager._client.close()

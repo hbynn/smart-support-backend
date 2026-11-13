@@ -347,3 +347,81 @@ def test_cancelled_probe_releases_exclusive_slot():
         assert not agent.stats.probe_running
         assert not agent.stats.available()
     asyncio.run(run())
+
+
+def make_policy_orchestrator():
+    from collections import deque
+    orchestrator = AgentOrchestrator.__new__(AgentOrchestrator)
+    orchestrator._pool = {
+        cls.agent_type: [cls(FakeClient(), "test")]
+        for cls in (GeneralAgent, TechnicalAgent, BillingAgent, EscalationAgent)
+    }
+    orchestrator._recent_tool_traces = deque(maxlen=200)
+    orchestrator._composer = ResponseComposer(FakeClient(error=RuntimeError("offline")), "test")
+    async def execute(req, agent_type):
+        return AgentResponse(agent_type, f"answer:{agent_type.value}", True)
+    orchestrator._execute = execute
+    return orchestrator
+
+
+def test_critical_preserves_specialist_answer_and_marks_escalation():
+    for intent, message, expected in (
+        (IntentCategory.TECHNICAL_CRASH, "立刻处理崩溃", AgentType.TECHNICAL),
+        (IntentCategory.REFUND, "立刻退款", AgentType.BILLING),
+    ):
+        orchestrator = make_policy_orchestrator()
+        for urgency in UrgencyLevel:
+            req = make_request(message=message, intent=intent, urgency=urgency, entities={})
+            result = asyncio.run(orchestrator.run(req))
+            assert result.primary_agent == expected
+            assert result.response == f"answer:{expected.value}"
+            assert result.escalated == (urgency == UrgencyLevel.CRITICAL)
+            assert result.escalation_reason == ("critical_urgency" if result.escalated else None)
+            assert result.urgency == urgency.name
+            trace = orchestrator.get_tool_trace(req.request_id)
+            assert trace["urgency"] == urgency.name
+            assert trace["escalation_reason"] == result.escalation_reason
+            assert orchestrator._route(intent, urgency) == expected
+
+
+def test_critical_parallel_keeps_both_domains_and_escalation():
+    orchestrator = make_policy_orchestrator()
+    result = asyncio.run(orchestrator.run(make_request(urgency=UrgencyLevel.CRITICAL)))
+    assert result.primary_agent == AgentType.TECHNICAL
+    assert result.supporting_agents == [AgentType.BILLING]
+    assert "answer:technical" in result.response
+    assert "answer:billing" in result.response
+    assert result.escalated
+    assert result.escalation_reason == "critical_urgency"
+
+
+def test_explicit_handoff_still_overrides_domains():
+    for intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
+        orchestrator = make_policy_orchestrator()
+        result = asyncio.run(orchestrator.run(make_request(intent=intent)))
+        assert result.primary_agent == AgentType.ESCALATION
+        assert result.supporting_agents == []
+        assert result.escalation_reason == "explicit_handoff"
+
+
+def test_critical_clarification_retains_escalation_requirement():
+    orchestrator = make_policy_orchestrator()
+    result = asyncio.run(orchestrator.run(make_request(
+        intent=IntentCategory.OTHER, intent_confidence=0.1,
+        message="立刻帮帮我", urgency=UrgencyLevel.CRITICAL,
+    )))
+    assert result.primary_agent == AgentType.GENERAL
+    assert result.escalated
+    assert result.escalation_reason == "critical_urgency"
+
+
+def test_agent_requested_escalation_is_independent_of_urgency():
+    orchestrator = make_policy_orchestrator()
+    async def execute(req, agent_type):
+        return AgentResponse(agent_type, "需要人工确认", True, escalate=True)
+    orchestrator._execute = execute
+    result = asyncio.run(orchestrator.run(make_request(
+        message="登录失败", entities={}, urgency=UrgencyLevel.LOW,
+    )))
+    assert result.primary_agent == AgentType.TECHNICAL
+    assert result.escalation_reason == "agent_requested"

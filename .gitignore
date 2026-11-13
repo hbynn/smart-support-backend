@@ -34,3 +34,6 @@ build-image*.sh
 *~
 *.bak
 docker-compose(1).yml
+
+# Windows local virtual environment
+.venv-win/

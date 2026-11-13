@@ -19,6 +19,8 @@ import os
 import threading
 from typing import Any, Dict, List, Optional
 
+from tooling.policy_search import LexicalIndex, passages
+
 import chromadb
 
 logger = logging.getLogger(__name__)
@@ -104,7 +106,9 @@ class KnowledgeBase:
         with self._write_lock:
             for identity, (title, content, explicit) in prepared.items():
                 document_id = hashlib.sha256(identity.encode()).hexdigest()
-                chunks = self._chunk_text(content, chunk_size=500)
+                sections = list(passages(content, self._chunk_text))
+                chunks = [chunk for chunk, _, _, _ in sections]
+                self._lexical = None
                 version = hashlib.sha256(content.encode()).hexdigest()
                 ids = [f"{document_id}:{i}" for i in range(len(chunks))]
                 existing = self._collection.get(where={"document_id": document_id}, include=["metadatas"])
@@ -124,7 +128,9 @@ class KnowledgeBase:
                                    if not (meta or {}).get("document_id"))
                 self._collection.upsert(ids=ids, documents=chunks, metadatas=[
                     {"title": title, "document_id": document_id, "version": version,
-                     "chunk_index": i, "total_chunks": len(chunks)} for i in range(len(chunks))
+                     "chunk_index": i, "total_chunks": len(chunks),
+                     "section": sections[i][1], "parent_id": f"{document_id}:{sections[i][2]}",
+                     "evidence": sections[i][3]} for i in range(len(chunks))
                 ])
                 stale = old_ids - set(ids)
                 if stale:
@@ -145,31 +151,30 @@ class KnowledgeBase:
         """
         if type(top_k) is not int or not 1 <= top_k <= 20:
             raise ValueError("top_k 必须是 1–20 的整数")
-        count = self._collection.count()
-        if not count:
-            return []
-        results = self._collection.query(
-            query_texts=[query],
-            n_results=min(top_k, count),
-        )
-
-        items = []
-        if results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
-            ):
-                items.append({
-                    "title":    meta.get("title", ""),
-                    "content":  doc,
-                    "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
-                    "chunk":    meta.get("chunk_index", 0),
-                    "document_id": meta.get("document_id", ""),
-                    "version": meta.get("version", ""),
-                })
-
-        return items
+        with self._write_lock:
+            count = self._collection.count()
+            if not count:
+                return []
+            if getattr(self, "_lexical", None) is None:
+                self._lexical = LexicalIndex(self._collection.get(include=["documents", "metadatas"]))
+            limit = min(count, top_k * 3)
+            vector = self._collection.query(query_texts=[query], n_results=limit,
+                                            include=["documents", "metadatas"])
+            vector_ids = vector["ids"][0]
+            records = dict(zip(vector_ids, zip(vector["documents"][0], vector["metadatas"][0])))
+            lexical_ids = self._lexical.rank(query, limit)
+            fused = {}
+            for ranking in (vector_ids, lexical_ids):
+                for rank, key in enumerate(ranking, 1):
+                    fused[key] = fused.get(key, 0) + 1 / (60 + rank)
+            items = []
+            for key in sorted(fused, key=fused.get, reverse=True)[:top_k]:
+                doc, meta = records.get(key) or self._lexical.items[key]
+                items.append({"title": meta.get("title", ""), "content": doc, "score": fused[key],
+                              "chunk": meta.get("chunk_index", 0), "document_id": meta.get("document_id", ""),
+                              "version": meta.get("version", ""), "section": meta.get("section", ""),
+                              "evidence": meta.get("evidence", doc), "parent_id": meta.get("parent_id", key)})
+            return items
 
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
