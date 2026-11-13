@@ -1,5 +1,5 @@
 # 智能客服工单平台
-由 [hbynn](https://github.com/hbynn) 维护的个人项目，聚焦智能客服与退款工单处理。
+聚焦智能客服与退款工单处理。
 
 - [Python 后端](https://github.com/hbynn/smart-support-backend)：对话服务、退款工作流、业务工具与数据持久化。
 - [Web 前端](https://github.com/hbynn/smart-support-frontend)：客服对话、知识库操作和运行状态查看。
@@ -739,4 +739,3 @@ docker-compose.yml             后端及依赖部署
 | `GET` | `/tickets/{ticket_id}/audit` | 查看审计轨迹 |
 | `GET` | `/orders/{order_id}` | 查看演示订单 |
 
-完整代码说明和调用示例见 [退款工单设计](wiki/退款工单设计.md)。
