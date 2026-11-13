@@ -1,14 +1,20 @@
 # 智能客服工单平台
+由 [hbynn](https://github.com/hbynn) 维护的个人项目，聚焦智能客服与退款工单处理。
 
-智能客服工单平台是面向客服场景的多 Agent 应用，提供通用咨询、技术支持、账单处理和升级转人工等处理路径。它把意图识别、Agent 路由、知识库检索、外部工具、会话记忆和评测串在同一条对话链路中，适合学习 Agent 工程、验证业务流程和扩展自己的客服场景。
+- [Python 后端](https://github.com/hbynn/smart-support-backend)：对话服务、退款工作流、业务工具与数据持久化。
+- [Web 前端](https://github.com/hbynn/smart-support-frontend)：客服对话、知识库操作和运行状态查看。
+
+
+智能客服工单平台是面向客服场景的多 Agent 应用，提供通用咨询、技术支持、账单处理和升级转人工等处理路径。它把意图识别、Agent 路由、知识库检索、外部工具、会话记忆和评测串在同一条对话链路中，支持客服咨询、退款审批和工单处理的业务闭环。
 
 本仓库是 **Python 后端**，使用 FastAPI 提供 HTTP API，并提供标准 MCP 服务端。配套 Web 前端和 Java 后端位于独立项目中；只运行本仓库即可通过 Swagger 或 HTTP 客户端使用 Python 服务。
 
-当前账单工具提供核验字段检查和金额差值计算，人工升级提供交接摘要。实际订单查询、退款执行和工单创建，需要接入对应业务系统。
+已实现基于 SQLite 的订单、退款工单、审批、幂等执行、结果核验与审计链路。当前退款为本地业务演示，真实资金退回需要对接支付渠道和订单系统。
 
 ## 目录
 
 - [项目能力与工作流程](#overview)
+- [退款工单链路](#refund-workflow)
 - [快速启动](#quickstart)
 - [配置说明](#configuration)
 - [在线 Embedding 配置](#intent-embedding-setup)
@@ -74,6 +80,66 @@ Redis 事务写入用户消息、助手回复和响应回执
 
 意图融合默认权重为 LLM 0.7、Embedding 0.2、Pattern 0.1。正常投票先累计同领域的粗、细意图分数，再选择领域内的意图；Pattern 细化要求领域一致。默认低置信度阈值为 0.5，另有识别失败和细化分支。权重与阈值定义在 [意图识别器](core/intent_recognizer.py)，不是 `.env` 配置项；应根据业务标注集验证后调整，不能将融合分数直接视为准确率。
 
+<a id="refund-workflow"></a>
+
+## 退款工单链路
+
+退款链路在 Python 后端实现，由确定性工作流推进状态。聊天咨询与工单执行分开：用户在聊天中提出退款诉求后，可通过 `POST /tickets` 显式创建工单；聊天回复本身不代表已退款。
+
+1. **创建与去重**：接收用户、订单号、金额和原因；可从消息提取订单号及带单位的金额。重复的用户、订单和金额组合复用已有工单。
+2. **补齐信息**：缺少订单号进入 `COLLECTING_INFO`，调用补充信息接口后继续规划。
+3. **查询与校验**：查询订单归属，检查订单状态及金额；金额须大于零且不超过订单金额，已退款或已取消订单不能再次退款。
+4. **风险审批**：金额达到 `REFUND_APPROVAL_THRESHOLD`（默认 100）进入 `WAITING_APPROVAL`；低于阈值直接执行。审批通过后执行，拒绝后进入 `REJECTED`。
+5. **幂等执行**：使用 `refund:{ticket_id}` 作为幂等键。退款工具再次检查工单状态、审批记录和操作参数；SQLite 事务负责写入退款记录与更新订单。
+6. **结果核验**：执行后进入 `VERIFYING`，按幂等键查询退款记录，查到后进入 `RESOLVED`。超时不直接视为失败，避免重复退款。
+7. **恢复与审计**：重试前先查询已有结果，再决定是否用相同幂等键执行；关键状态变更、审批、执行和核验事件均保留审计记录。
+
+```text
+创建 → 信息收集 → 规划与校验
+                    ├─ 低风险 → 执行
+                    └─ 高风险 → 等待审批 → 通过 → 执行
+                                      └─ 拒绝 → REJECTED
+执行 → 核验 → RESOLVED
+         └─ FAILED / VERIFYING → 重试前查询已有结果
+```
+
+### 接口与体验方式
+
+启动后打开 `http://localhost:8000/docs`，在“售后工单”分组调用接口。请使用数据库中实际存在且属于请求用户的订单。
+
+- `POST /tickets`：创建工单，请求示例见下方。
+- `GET /tickets/{ticket_id}`：查询工单状态和执行结果。
+- `POST /tickets/{ticket_id}/details`：补充订单号，可携带金额和原因。
+- `POST /tickets/{ticket_id}/approve`：审批通过，随后执行退款。
+- `POST /tickets/{ticket_id}/reject`：拒绝审批，携带 `actor` 和 `reason`。
+- `POST /tickets/{ticket_id}/retry`：查询并恢复执行，携带 `actor`。
+- `GET /tickets/{ticket_id}/audit`：查询审计事件。
+- `GET /orders/{order_id}?user_id=用户ID`：查询演示订单。
+
+```json
+{
+  "user_id": "订单所属用户ID",
+  "message": "申请退款",
+  "order_id": "实际订单号",
+  "amount": 50,
+  "reason": "用户申请退款"
+}
+```
+
+如需关联来源聊天，同时传入 `source_conv_id` 和 `source_request_id`，后端会校验对应用户的对话回执。审批请求示例为 `{"actor":"operator"}`；状态不允许的操作返回 409，工单不存在返回 404。
+
+### 配置与实现位置
+
+在后端 `.env` 中设置 `SUPPORT_DB_PATH` 指定 SQLite 文件位置，通过 `REFUND_APPROVAL_THRESHOLD` 调整审批阈值。其他启动与鉴权配置请按 [.env.example](.env.example) 的实际配置项填写。
+
+- [工作流](workflow/ticket_workflow.py)：状态转换、审批、执行、核验与重试。
+- [业务工具](tooling/support_tools.py)：订单查询、退款校验和执行保护。
+- [数据仓储](domain/repository.py)：SQLite 持久化、事务和幂等记录。
+- [审计记录](audit/audit_logger.py)：业务事件留痕。
+- [HTTP 接口](api/main.py)：工单接口与聊天关联。
+
+当前 `RESOLVED` 表示本地退款记录已核验，不代表银行或支付平台到账。接入真实支付服务时，需要替换业务适配实现并核验支付渠道的最终状态。
+
 <a id="quickstart"></a>
 
 ## 快速启动
@@ -104,9 +170,8 @@ ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
 ANTHROPIC_MODEL=替换为服务商当前支持的模型ID
 ANTHROPIC_API_KEY=替换为该模型服务的Key
 
-# 本地演示模式
-ECHOMIND_ENV=development
-REDIS_PASSWORD=echomind123
+# Redis 密码须与服务端一致
+REDIS_PASSWORD=替换为你的Redis密码
 
 # Docker 网络内的 ChromaDB 地址
 CHROMA_HOST=chromadb
@@ -126,10 +191,8 @@ SILICONFLOW_API_KEY=
 ```bash
 docker compose up -d --build
 docker compose ps
-docker compose logs -f echomind
 ```
 
-根目录 Compose 启动 EchoMind API、Redis、ChromaDB、Prometheus 和 Nginx。**它不包含 Web 前端页面**，Nginx 在这里代理后端接口。
 
 | 入口 | 地址 | 用途 |
 |---|---|---|
@@ -143,38 +206,12 @@ docker compose logs -f echomind
 
 ### 4. 使用配套 Web 前端（可选）
 
-本机已有根目录 Compose 数据环境时，可以直接叠加 Web 配置，复用现有 Python、Redis 和 ChromaDB 数据：
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.web.yml up -d --build
-```
-
-此配置同时启动前端和 Java 后端，页面入口为 `http://localhost:5174` 或 `http://localhost`；Python API 保持 `http://localhost:8000`，Java API 为 `http://localhost:8080`。前端经同源路径代理请求，模型 Key 只传入后端。Java 使用本机既有数据卷 `echomindjava_app-data`；没有该卷时先执行 `docker volume create echomindjava_app-data`，也可通过 `ECHOMIND_JAVA_DATA_VOLUME` 指定另一个已有卷。后续启动、重建和停止这套环境时均携带上述两个 `-f` 参数。
-
-如果同时拥有前端和 Java 项目，按配套 Compose 的相对路径摆放：
-
-```text
-同一个父目录/
-  EchoMind/           Python 后端，.env 放在这里
-  EchoMindFrontend/   Web 前端及全栈 Compose
-  EchoMindJava/       Java 后端及其 .env
-```
-
-先按各项目说明配置环境，再在 `EchoMindFrontend` 目录执行：
-
-```bash
-docker compose --env-file ../EchoMind/.env up -d --build
-```
-
-该部署的前端默认入口为 `http://localhost:5174`，也可经网关 `http://localhost` 访问。Python 服务名为 `echomind-python`，通过 `env_file` 读取 `../EchoMind/.env`；命令中的 `--env-file` 同时让 Compose 插值使用该文件里的 Redis 密码等值。
-
-两套 Compose 会使用重叠的端口和容器名，选择一种运行。切换部署方式前停止原来的那套；两套 Compose 的数据卷也相互独立，不会自动搬迁知识库和会话数据。
+参考 [Web 前端仓库](https://github.com/hbynn/smart-support-frontend) 的本地启动说明。Python API 默认监听 8000 端口。联合部署前请核对 Compose 中的构建路径、环境文件和数据卷配置是否匹配本机目录。
 
 <a id="configuration"></a>
 
 ## 配置说明
 
-所有后端凭据放在 **EchoMind 根目录 `.env`** 或服务端环境变量中，不放入前端 `VITE_*` 变量。
 
 ### 常用配置
 
@@ -187,8 +224,6 @@ docker compose --env-file ../EchoMind/.env up -d --build
 | `REDIS_URL` | 应用连接地址；根目录 Compose 根据 `REDIS_PASSWORD` 覆盖为容器网络地址。 |
 | `CHROMA_HOST` / `CHROMA_PORT` | Docker 使用 `chromadb:8000`；宿主机开发使用 `localhost:8001`。 |
 | `CHROMA_PERSIST_DIRECTORY` | development 无法连接远端 ChromaDB 时的本地存储路径；容器内为 `/app/data/chroma`。production 连接失败时中止启动。 |
-| `ECHOMIND_SEED_DEMO_DOCS` | development 空库是否自动导入示例政策，默认 `true`；production 始终禁止自动导入。 |
-| `ECHOMIND_INTENT_TIMEOUT_S` / `ECHOMIND_LLM_TIMEOUT_S` / `ECHOMIND_COMPOSER_TIMEOUT_S` | 意图识别、Agent 每次模型请求和汇总模型请求的超时，默认 8 / 15 / 8 秒；均受聊天 50 秒总预算限制。 |
 | `PROFILE_UPDATE_MIN_INTERVAL_S` | 普通后台画像最短更新间隔，默认 60 秒；明确表达偏好时立即更新。设为 0 恢复逐轮更新。会话消息和业务字段仍每轮保存。 |
 | `LOG_LEVEL` | 日志级别，默认 `INFO`。 |
 | `INTENT_EMBEDDING_ENABLED` | 是否执行向量分支，默认 `true`；设为 `false` 后仅融合 LLM 和规则。 |
@@ -196,32 +231,23 @@ docker compose --env-file ../EchoMind/.env up -d --build
 | `SILICONFLOW_API_KEY` | 可选，在线意图向量使用的独立 Key。 |
 | `MCP_EXTERNAL_ENABLED` | 默认 `true`；设为 `false` 关闭外部 MCP 客户端。 |
 | `MCP_SERVERS_CONFIG` | 外部 MCP 配置文件路径，默认 `config/mcp_servers.json`。 |
-| `ECHOMIND_SKILLS_DIR` | Skills 根目录；Compose 挂载为 `/app/skills`。 |
-| `ECHOMIND_SKILLS_MAX_PROMPT_CHARS` | Skills 注入字符预算，默认 5000。 |
-| `ECHOMIND_ENV` | 鉴权部署模式，默认 `development`；`production` 必须配置访问 Token。 |
-| `ECHOMIND_API_TOKENS` | 访问 Token 与用户、角色的 JSON 映射，见部署章节。 |
 
-`APP_ENV` 与 `ECHOMIND_ENV` 用途不同：前者控制 `python api/main.py` 的开发热重载，后者控制生产鉴权要求。Docker 镜像通过 Uvicorn 启动，监听地址和端口由镜像命令指定；修改 `API_HOST`、`API_PORT` 不会改变 Compose 的端口映射。
 
 ### 修改配置后如何生效
 
 在根目录部署中：
 
 ```bash
-# 只改 .env：重新创建应用容器，让它读入环境变量。
-docker compose up -d --force-recreate echomind
+# 只改 .env：重新创建容器，让它读入环境变量。
+docker compose up -d --force-recreate
 
 # 改了应用代码或依赖：重新构建并启动。
-docker compose up -d --build echomind
+docker compose up -d --build
 ```
 
-修改 Redis 密码时，需要同时更新 Redis 和应用，可执行 `docker compose up -d --force-recreate redis echomind`。只执行 `restart` 不会重新读取容器的 `.env`。
 
-从前端目录部署时，使用对应的服务名和配置来源：
+联合部署请依据前端 Compose 中的实际服务名和环境文件路径操作。
 
-```bash
-docker compose --env-file ../EchoMind/.env up -d --build --force-recreate echomind-python
-```
 
 <a id="intent-embedding-setup"></a>
 
@@ -240,7 +266,6 @@ docker compose --env-file ../EchoMind/.env up -d --build --force-recreate echomi
 
 1. 在[硅基流动中国站控制台](https://cloud.siliconflow.cn/)注册或登录，按平台要求开通账号。
 2. 进入 API 密钥管理，创建 Key，并确认账号可使用 `BAAI/bge-m3`。
-3. 在 **EchoMind/.env** 中填写：
 
 ```dotenv
 INTENT_EMBEDDING_ENABLED=true
@@ -254,17 +279,8 @@ SILICONFLOW_API_KEY=替换为你自己的硅基流动Key
 | `local` | 始终使用本地 n-gram。 |
 | `siliconflow` | 指定在线提供方；缺少 Key 或调用失败时仍会本地降级。 |
 
-地址固定为 `https://api.siliconflow.cn/v1/embeddings`，接口格式见[官方 Embedding 文档](https://api-docs.siliconflow.cn/docs/api/embeddings-post)。硅基流动 Key、聊天模型 Key、EchoMind API 访问 Token 是三种不同凭据，不能互换。
 
 ### 2. 重新创建容器
-
-在 EchoMind 根目录执行：
-
-```bash
-docker compose up -d --force-recreate echomind
-```
-
-如果代码尚未构建过，加上 `--build`。从前端目录运行的用户，使用上一节中的 `echomind-python` 命令。
 
 ### 3. 验证实际调用
 
@@ -295,7 +311,6 @@ curl -X POST http://localhost:8000/integrations/embedding/check \
 ```bash
 .venv/bin/python scripts/check_embedding.py --message '这笔钱能退给我吗？'
 # 或在运行中的容器执行
-docker compose exec -T echomind python scripts/check_embedding.py
 ```
 
 本地脚本使用 Python 3.12 并安装项目依赖。在线检查成功退出码为 `0`，本地降级或分支关闭时为 `1`，便于在批量评测之前阻止误用本地向量。自己编写测试脚本时，同样需要在创建 `IntentRecognizer` 前加载 `.env`。
@@ -315,7 +330,6 @@ docker compose exec -T echomind python scripts/check_embedding.py
 
 ## 对话与知识库使用
 
-以下示例按本地未启用鉴权的服务编写。启用后，HTTP 请求还需添加 `Authorization: Bearer <EchoMind访问Token>`。
 
 ### 发送消息
 
@@ -433,16 +447,13 @@ General、Technical Agent 可以按需查询该服务；Billing、Escalation 不
 - 需要认证时，通过 `headers_env` 将请求头映射到服务端环境变量，例如 `{"Authorization":"PRIVATE_MCP_AUTH_HEADER"}`；该变量的值填写完整的 `Bearer ...`。
 - stdio 服务使用 `transport: "stdio"`、`command`、`args`，所需可执行程序必须存在于应用运行环境；附加环境变量通过 `env_vars` 显式配置。
 - `read_only=true` 时，工具还必须声明只读且未声明破坏性操作；缺少相应声明的工具不会开放。
-- 配置文件已只读挂载进容器。只修改 JSON 后可 `docker compose restart echomind`；同时修改环境变量时应重新创建容器。
 
 外部服务只收到调用参数，不自动收到聊天历史、画像或模型 Key。连接失败会标记断开并重试，本地工具仍可使用。返回内容超出上限会标记 `truncated=true`，预览不能当成完整原文。
 
-### 让其他 MCP 客户端访问 EchoMind
 
 连接地址为 **`http://localhost:8000/mcp/`**，保留末尾斜杠。当前提供：
 
 - 工具：`search_local_knowledge(query, top_k)`。
-- 资源：`echomind://knowledge/stats`。
 
 这是标准 MCP 入口；`/integrations/mcp/*` 是外部客户端的 REST 调试接口。使用自定义域名时配置 `MCP_ALLOWED_HOSTS`，涉及浏览器来源时配置 `MCP_ALLOWED_ORIGINS`；启用接口鉴权后，MCP 客户端也需要发送访问 Token。
 
@@ -537,7 +548,6 @@ queued -> running -> completed
 | `GET /trace/tool/{request_id}` | 查看一次聊天的路由和工具轨迹。 |
 | `GET /trace/tools?limit=20` | 查看最近的聊天轨迹。 |
 
-监控降权使用最近 300 秒、最多 50 次已完成调用，至少 5 个样本参与计算。专业 Agent 达到降权条件后进入冷却，默认 60 秒；之后通过一次恢复探测决定恢复还是继续冷却。可用 `ECHOMIND_MONITOR_COOLDOWN_SECONDS` 调整冷却时间。
 
 聊天轨迹脱敏后存入 Redis，保留 7 天，最近列表最多 200 条；专业 Agent 失败回退时保留两次尝试的工具轨迹及回退事件。
 
@@ -566,7 +576,7 @@ docker compose up -d redis chromadb
 原生 Python 进程无法通过 Docker 服务名访问存储，在 `.env` 中改成宿主机地址：
 
 ```dotenv
-REDIS_URL=redis://:echomind123@localhost:6379/0
+REDIS_URL=redis://:你的Redis密码@localhost:6379/0
 CHROMA_HOST=localhost
 CHROMA_PORT=8001
 CHROMA_PERSIST_DIRECTORY=./data/chroma
@@ -589,9 +599,9 @@ python -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 
-# 真实 Redis / ChromaDB 的集成检查，在已启动的根目录部署中执行。
-docker compose exec -T echomind python tests/verify_request_concurrency.py
-docker compose exec -T echomind python tests/verify_chat_atomic.py
+# 已配置本地 Redis / ChromaDB 连接后运行集成检查。
+python tests/verify_request_concurrency.py
+python tests/verify_chat_atomic.py
 ```
 
 集成检查使用临时测试数据并清理。单元测试通过不代表模型平台鉴权成功，部署后仍需验证真实 `/chat`；在线 Embedding 和外部 MCP 分别按前文确认调用来源和工具结果。
@@ -602,18 +612,10 @@ docker compose exec -T echomind python tests/verify_chat_atomic.py
 
 ### API 访问鉴权
 
-本地演示可使用 `ECHOMIND_ENV=development` 并留空 `ECHOMIND_API_TOKENS`。对外部署设置：
-
-```dotenv
-ECHOMIND_ENV=production
-ECHOMIND_API_TOKENS='{"替换为至少24字符的随机用户Token":{"user_id":"u1","role":"user"},"替换为至少24字符的随机管理员Token":{"user_id":"admin","role":"admin"}}'
-```
+按 [.env.example](.env.example) 及 [鉴权实现](api/main.py) 中的实际配置名设置部署模式和访问 Token。生产模式须配置用户与管理员的 Token 映射，客户端使用 Authorization: Bearer <访问Token> 请求接口。
 
 用独立随机值替换示例中的 Token，可通过 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 生成。生产模式缺少或配置无效时启动失败。客户端发送：
 
-```http
-Authorization: Bearer <EchoMind访问Token>
-```
 
 - 普通用户可访问聊天、共享知识查询、Skills 列表和本地 MCP；聊天身份来自 Token 中的 `user_id`。
 - 管理员可访问评测、轨迹、知识库写入、监控、集成调试等接口。
@@ -639,7 +641,6 @@ Authorization: Bearer <EchoMind访问Token>
 
 ```bash
 docker compose ps
-docker compose logs --tail=100 echomind
 docker compose down
 ```
 
@@ -662,7 +663,6 @@ docker compose down
 | 容器构建失败或长时间停留在下载 | 查看构建日志，区分镜像拉取、Python 依赖安装和 ONNX 模型下载；首次构建需要这些网络资源。 |
 | 健康检查正常，但聊天失败 | 查看应用日志和模型服务响应，核对 Key、Anthropic 兼容地址、模型 ID、额度及工具调用支持。 |
 | 修改 `.env` 后不生效 | 重新创建应用容器；`restart` 只重启原容器。确认编辑的是 Python 项目的 `.env`。 |
-| 前端选择 Python 后不可用 | 在前端目录查看 `docker compose logs --tail=100 echomind-python`，检查 Python 健康接口及连接设置；按前文带 `--env-file` 的命令启动。 |
 | Redis 认证失败 | 检查 Redis 启动密码与应用 `REDIS_URL` 是否一致。改变密码后同时重新创建 Redis 和应用。 |
 | Embedding 的 `online_configured=false` | 检查 Key 是否为空、模式是否为 `local`、容器是否重新创建。 |
 | Embedding 返回 `http_401` / `http_403` | 检查是否使用硅基流动 Key，以及账号对当前模型的权限。 |
@@ -672,7 +672,6 @@ docker compose down
 | 评测只有任务 ID，没有分数 | 使用 `/eval/jobs/{job_id}` 轮询，在任务完成后读取 `result`。 |
 | 评测失败较多 | 查看 `judge_error_type`、`judge_stop_reason`、`judge_attempts`；区分鉴权、超时、截断、JSON 格式和评分字段错误。 |
 | 评测任务返回 404 / 提交返回 429 | 分别表示任务不存在或已过期、未完成队列已满；重启会清空任务状态，避免重复提交堆积。 |
-| API 返回 401 / 403 | 检查 EchoMind 访问 Token 和角色；管理员接口不能使用普通用户 Token。 |
 | 端口或容器名冲突 | 检查是否同时启动了根目录和前端目录两套 Compose，停止不使用的一套。 |
 
 <a id="documentation"></a>
@@ -706,14 +705,12 @@ docker-compose.yml             后端及依赖部署
 
 | 文档 | 适合阅读的内容 |
 |---|---|
-| [01—12 源码教程](wiki/教程/README.md) | 从启动、请求链路到工具、知识库、记忆、监控与评测，附动手实验。 |
 | [完整使用指南](wiki/完整使用指南.md) | 功能操作与使用细节。 |
 | [业务流程说明](wiki/业务流程说明.md) | 一次请求从接收到响应的处理过程。 |
 | [技术亮点](wiki/技术亮点.md) | 设计选择、实现方式和适用边界。 |
 | [重点代码](wiki/重点代码.md) | 核心模块的代码阅读说明。 |
 | [Skills 使用说明](skills/README.md) | 自定义业务规则的格式与加载方式。 |
-| [场景扩展指南](wiki/EchoMind%20场景扩展指南.md) | 将项目扩展到其他业务场景。 |
-| [文档中心](wiki/文档中心.md) | 其他学习和项目资料入口。 |
+| [文档中心](wiki/文档中心.md) | 功能设计、架构和运维文档入口。 |
 
 具体日期的改动记录见项目根目录的更新说明；本 README 介绍当前项目能力、配置和使用方式。
 
@@ -742,4 +739,4 @@ docker-compose.yml             后端及依赖部署
 | `GET` | `/tickets/{ticket_id}/audit` | 查看审计轨迹 |
 | `GET` | `/orders/{order_id}` | 查看演示订单 |
 
-完整代码说明和调用示例见 `wiki/售后工单改造学习指南.md`。
+完整代码说明和调用示例见 [退款工单设计](wiki/退款工单设计.md)。

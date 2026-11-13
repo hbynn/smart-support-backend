@@ -2,10 +2,10 @@
 services:
   prometheus:
     volumes:
-      - ./wiki/教程/examples/prometheus.auth.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus.auth.yml:/etc/prometheus/prometheus.yml:ro
     secrets:
       - echomind_metrics_token
 
 secrets:
   echomind_metrics_token:
-    file: ./data/tutorial/metrics-admin-token
+    file: ./data/monitoring/metrics-admin-token
