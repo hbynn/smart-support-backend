@@ -2,25 +2,18 @@
 
 import argparse
 import json
-import os
 import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from uuid import uuid4
 
 import httpx
 
-# The fixed user and the HTTP adapter do not use LiteLLM providers.
-os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
-
-from tau2.agent.base_agent import HalfDuplexAgent
-from tau2.data_model.message import AssistantMessage, UserMessage
+if __package__:
+    from .tau2_dialog import EchoMindAgent, run_dialog
+else:
+    from tau2_dialog import EchoMindAgent, run_dialog
 from tau2.data_model.simulation import TerminationReason
-from tau2.data_model.tasks import Task, UserScenario
-from tau2.orchestrator.orchestrator import Orchestrator
-from tau2.runner import build_environment
-from tau2.user.user_simulator_base import HalfDuplexUser
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,45 +21,6 @@ CASE_PATH = ROOT / "evaluation" / "tau2_cases" / "refund_order_switch.json"
 DB_PATH = ROOT / "data" / "support" / "eval.db"
 DEFAULT_REPORT = ROOT / "data" / "eval" / "tau2_refund_baseline.json"
 TICKET_ID = re.compile(r"\bticket_[0-9a-f]{12}\b", re.IGNORECASE)
-
-
-class FixedUser(HalfDuplexUser):
-    def __init__(self, turns):
-        super().__init__()
-        self.messages = [turn["message"] for turn in turns] + ["###STOP###"]
-
-    def get_init_state(self, message_history=None):
-        return 0
-
-    def generate_next_message(self, message, state):
-        return UserMessage.text(self.messages[state]), state + 1
-
-
-class EchoMindAgent(HalfDuplexAgent):
-    def __init__(self, client, user_id):
-        super().__init__(tools=[], domain_policy="")
-        self.client = client
-        self.user_id = user_id
-        self.conv_id = f"tau-{uuid4().hex}"
-        self.replies = {}
-
-    def get_init_state(self, message_history=None):
-        return 0
-
-    def generate_next_message(self, message, state):
-        response = self.client.post(
-            "/chat",
-            json={
-                "user_id": self.user_id,
-                "conv_id": self.conv_id,
-                "client_request_id": f"{self.conv_id}-{state}",
-                "message": message.content,
-            },
-        )
-        response.raise_for_status()
-        reply = response.json()
-        self.replies[state] = reply
-        return AssistantMessage.text(reply["response"]), state + 1
 
 
 def prepare_tickets(client, case):
@@ -153,18 +107,12 @@ def main():
         before = read_results(case, ticket_ids)
 
         agent = EchoMindAgent(client, case["user_id"])
-        run = Orchestrator(
-            domain="mock",
-            agent=agent,
-            user=FixedUser(case["turns"]),
-            environment=build_environment("mock"),
-            task=Task(
-                id=case["id"],
-                user_scenario=UserScenario(instructions="查询退款进度，再纠正订单号。"),
-                agent_opener="你好，请问有什么可以帮你？",
-            ),
-            max_steps=2 * len(case["turns"]) + 4,
-        ).run()
+        run = run_dialog(
+            agent,
+            case_id=case["id"],
+            instructions="查询退款进度，再纠正订单号。",
+            messages=[turn["message"] for turn in case["turns"]],
+        )
         after = read_results(case, ticket_ids)
 
     checks = grade(case, ticket_ids, agent, run, before, after)
