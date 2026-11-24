@@ -1,0 +1,22 @@
+services:
+  redis:
+    container_name: !reset null
+    ports: !reset []
+  chromadb:
+    container_name: !reset null
+    ports: !reset []
+  echomind:
+    container_name: !reset null
+    ports: !override
+      - "127.0.0.1:18000:8000"
+    environment:
+      ECHOMIND_ENV: development
+      ECHOMIND_API_TOKENS: ""
+      MCP_EXTERNAL_ENABLED: "false"
+      SUPPORT_DB_PATH: /app/data/support/eval.db
+      REFUND_APPROVAL_THRESHOLD: "100"
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+networks:
+  echomind-network:
+    ipam: !reset null
