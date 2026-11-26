@@ -31,8 +31,12 @@ from anthropic import AsyncAnthropic
 from core.llm_utils import create_message, extract_text_content
 from core.performance import record_event
 from core.concurrency import KeyedLocks, redis_lease
+from tooling.policy_search import terms
 
 logger = logging.getLogger(__name__)
+RECENT_PROMPT_MESSAGES = 8
+EARLIER_MESSAGE_MAX_CHARS = 600
+MIN_RECALL_TERMS = 3
 
 
 class MsgRole(Enum):
@@ -57,6 +61,7 @@ class MemoryContext:
     user_profile:     Dict[str, Any]  # 用户画像：偏好、常用实体
     summary:          str             # 当前会话摘要（压缩后）
     state: Dict[str, Any] = field(default_factory=dict)
+    earlier_user_message: str = ""
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -72,9 +77,11 @@ class MemoryContext:
             parts.append("[相关历史]\n" + "\n".join(f"- {self._clean(h)}" for h in self.relevant_history[:3]))
         if self.user_profile:
             parts.append(f"[用户画像]\n{json.dumps(self.user_profile, ensure_ascii=True)}")
+        if self.earlier_user_message:
+            parts.append(f"[较早的相关用户消息]\nuser: {self._clean(self.earlier_user_message)}")
         if self.recent_messages:
             parts.append("[最近对话]")
-            for m in self.recent_messages[-8:]:
+            for m in self.recent_messages[-RECENT_PROMPT_MESSAGES:]:
                 parts.append(f"{m.role.value}: {self._clean(m.content)}")
         return "\n\n".join(parts)
 
@@ -346,6 +353,9 @@ class MemoryManager:
         # 4. 会话摘要（如果已压缩过）
         summary = await self._redis.get(self._summary_key(user_id, conv_id)) or ""
         state_raw = await self._redis.get(self._state_key(user_id, conv_id))
+        earlier_message = self._recall_earlier_user_message(recent, query)
+        if earlier_message:
+            record_event("working_memory_earlier_message_recalled")
 
         return MemoryContext(
             recent_messages=recent,
@@ -353,7 +363,31 @@ class MemoryManager:
             user_profile=profile,
             summary=summary,
             state=json.loads(state_raw) if state_raw else {},
+            earlier_user_message=earlier_message,
         )
+
+    @staticmethod
+    def _recall_earlier_user_message(recent: List[Message], query: str) -> str:
+        if len(recent) <= RECENT_PROMPT_MESSAGES:
+            return ""
+        query_terms = set(terms(query))
+        if len(query_terms) < MIN_RECALL_TERMS:
+            return ""
+
+        best_message = ""
+        best_score = MIN_RECALL_TERMS - 1
+        # Newer user messages win ties so an equally relevant correction stays current.
+        for offset, message in enumerate(reversed(recent)):
+            if message.role != MsgRole.USER:
+                continue
+            is_earlier = offset >= RECENT_PROMPT_MESSAGES
+            if is_earlier and len(message.content) > EARLIER_MESSAGE_MAX_CHARS:
+                continue
+            score = len(query_terms.intersection(terms(message.content)))
+            if score > best_score:
+                best_score = score
+                best_message = message.content if is_earlier else ""
+        return best_message
 
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 

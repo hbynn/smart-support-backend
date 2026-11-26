@@ -1,0 +1,20 @@
+{
+  "id": "refund_status_invoice",
+  "user_id": "demo_user",
+  "turns": [
+    {
+      "message": "查一下 A10002 的退款进度，另外发票补开需要什么？",
+      "order_id": "A10002",
+      "amount": 150,
+      "expected_state": "WAITING_APPROVAL",
+      "expected_reply_status": "等待人工审批",
+      "expected_refunds": [],
+      "invoice_guidance_terms": [
+        "订单号", "订单编号", "订单信息", "原发票", "发票号", "发票编号", "发票代码",
+        "抬头", "税号", "纳税人识别号", "购方信息", "开票信息", "开票资料", "开票邮箱",
+        "订单凭证", "购买凭证", "付款凭证", "支付凭证", "上传截图",
+        "订单详情", "发票中心", "联系客服", "联系在线客服", "联系人工客服", "联系商家", "联系开票方"
+      ]
+    }
+  ]
+}

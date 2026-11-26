@@ -1,0 +1,22 @@
+{
+  "id": "refund_order_switch",
+  "user_id": "demo_user",
+  "turns": [
+    {
+      "message": "查一下 A10001 的退款进度。",
+      "order_id": "A10001",
+      "amount": 50,
+      "expected_state": "RESOLVED",
+      "expected_reply_status": "已处理完成",
+      "expected_refunds": [{"amount": 50, "status": "SUCCEEDED"}]
+    },
+    {
+      "message": "我说错了，查一下 A10002 的退款进度。",
+      "order_id": "A10002",
+      "amount": 150,
+      "expected_state": "WAITING_APPROVAL",
+      "expected_reply_status": "等待人工审批",
+      "expected_refunds": []
+    }
+  ]
+}
