@@ -74,7 +74,11 @@ class TicketWorkflow:
             requested_amount=round(float(amount), 2) if amount is not None else None,
             reason=reason or message,
         )
-        ticket, created = await self._repository.create_ticket(ticket)
+        created_event = self._audit.event(
+            ticket.ticket_id, "ticket.created", actor=user_id,
+            detail={"order_id": order_id, "amount": amount},
+        )
+        ticket, created = await self._repository.create_ticket(ticket, audit_events=(created_event,))
         if not created:
             await self._audit.record(
                 ticket.ticket_id,
@@ -84,22 +88,16 @@ class TicketWorkflow:
             )
             return ticket
 
-        await self._audit.record(
-            ticket.ticket_id,
-            "ticket.created",
-            actor=user_id,
-            detail={"order_id": order_id, "amount": amount},
-        )
         if not order_id:
             ticket.state = TicketState.COLLECTING_INFO
             ticket.error = "缺少订单号"
-            await self._repository.save_ticket(ticket)
-            await self._audit.record(
+            event = self._audit.event(
                 ticket.ticket_id,
                 "ticket.missing_information",
                 actor="system",
                 detail={"missing": ["order_id"]},
             )
+            await self._repository.save_ticket(ticket, audit_events=(event,))
             return ticket
         return await self._plan(ticket)
 
@@ -122,13 +120,13 @@ class TicketWorkflow:
             ticket.reason = reason
         ticket.error = None
         ticket.state = TicketState.PLANNING
-        await self._repository.save_ticket(ticket)
-        await self._audit.record(
+        event = self._audit.event(
             ticket.ticket_id,
             "ticket.details_supplied",
             actor=actor,
             detail={"order_id": order_id, "amount": ticket.requested_amount},
         )
+        await self._repository.save_ticket(ticket, audit_events=(event,))
         return await self._plan(ticket)
 
     async def approve(self, ticket_id: str, *, actor: str) -> Ticket:
@@ -139,13 +137,13 @@ class TicketWorkflow:
         ticket.approved_at = utc_now()
         ticket.state = TicketState.EXECUTING
         ticket.error = None
-        await self._repository.save_ticket(ticket)
-        await self._audit.record(
+        event = self._audit.event(
             ticket.ticket_id,
             "ticket.approved",
             actor=actor,
             detail={"action": ticket.proposed_action},
         )
+        await self._repository.save_ticket(ticket, audit_events=(event,))
         return await self._execute_refund(ticket)
 
     async def reject(self, ticket_id: str, *, actor: str, reason: str) -> Ticket:
@@ -154,13 +152,13 @@ class TicketWorkflow:
             raise InvalidTransition(f"状态 {ticket.state.value} 不能拒绝")
         ticket.state = TicketState.REJECTED
         ticket.error = reason or "人工拒绝"
-        await self._repository.save_ticket(ticket)
-        await self._audit.record(
+        event = self._audit.event(
             ticket.ticket_id,
             "ticket.rejected",
             actor=actor,
             detail={"reason": ticket.error},
         )
+        await self._repository.save_ticket(ticket, audit_events=(event,))
         return ticket
 
     async def retry(self, ticket_id: str, *, actor: str) -> Ticket:
@@ -181,8 +179,8 @@ class TicketWorkflow:
 
         ticket.state = TicketState.EXECUTING
         ticket.error = None
-        await self._repository.save_ticket(ticket)
-        await self._audit.record(ticket.ticket_id, "ticket.retry", actor=actor)
+        event = self._audit.event(ticket.ticket_id, "ticket.retry", actor=actor)
+        await self._repository.save_ticket(ticket, audit_events=(event,))
         return await self._execute_refund(ticket)
 
     async def get_ticket(self, ticket_id: str) -> Ticket:
@@ -239,7 +237,7 @@ class TicketWorkflow:
             "amount": ticket.requested_amount,
             "idempotency_key": idempotency_key,
         }
-        await self._audit.record(
+        planned_event = self._audit.event(
             ticket.ticket_id,
             "ticket.planned",
             actor="system",
@@ -248,17 +246,17 @@ class TicketWorkflow:
 
         if ticket.risk_level == RiskLevel.HIGH:
             ticket.state = TicketState.WAITING_APPROVAL
-            await self._repository.save_ticket(ticket)
-            await self._audit.record(
+            waiting_event = self._audit.event(
                 ticket.ticket_id,
                 "ticket.waiting_approval",
                 actor="system",
                 detail={"threshold": self._approval_threshold},
             )
+            await self._repository.save_ticket(ticket, audit_events=(planned_event, waiting_event))
             return ticket
 
         ticket.state = TicketState.EXECUTING
-        await self._repository.save_ticket(ticket)
+        await self._repository.save_ticket(ticket, audit_events=(planned_event,))
         return await self._execute_refund(ticket)
 
     async def _execute_refund(self, ticket: Ticket) -> Ticket:
@@ -271,22 +269,17 @@ class TicketWorkflow:
         if result.success:
             ticket.result = dict(result.data)
             ticket.error = None
-            await self._audit.record(
-                ticket.ticket_id,
-                "refund.command_accepted",
-                actor="system",
-                detail=ticket.result,
-            )
+            await self._repository.save_ticket(ticket)
         else:
             # 超时不等于失败，可能下游已执行成功，因此进入 VERIFYING。
             ticket.error = result.error or "退款执行结果未知"
-            await self._audit.record(
+            event = self._audit.event(
                 ticket.ticket_id,
                 "refund.command_unknown",
                 actor="system",
                 detail={"error": ticket.error},
             )
-        await self._repository.save_ticket(ticket)
+            await self._repository.save_ticket(ticket, audit_events=(event,))
         return await self._verify_refund(ticket, actor="system")
 
     async def _verify_refund(self, ticket: Ticket, *, actor: str) -> Ticket:
@@ -302,13 +295,13 @@ class TicketWorkflow:
             ticket.state = TicketState.RESOLVED
             ticket.result = status.data["refund"]
             ticket.error = None
-            await self._repository.save_ticket(ticket)
-            await self._audit.record(
+            event = self._audit.event(
                 ticket.ticket_id,
                 "refund.verified",
                 actor=actor,
                 detail=ticket.result,
             )
+            await self._repository.save_ticket(ticket, audit_events=(event,))
             return ticket
 
         ticket.state = TicketState.FAILED if status.success else TicketState.VERIFYING
@@ -317,25 +310,25 @@ class TicketWorkflow:
             if status.success
             else status.error or "退款状态查询失败"
         )
-        await self._repository.save_ticket(ticket)
-        await self._audit.record(
+        event = self._audit.event(
             ticket.ticket_id,
             "refund.verification_failed",
             actor=actor,
             detail={"error": ticket.error, "state": ticket.state.value},
         )
+        await self._repository.save_ticket(ticket, audit_events=(event,))
         return ticket
 
     async def _fail(self, ticket: Ticket, message: str, detail: Optional[str] = None) -> Ticket:
         ticket.state = TicketState.FAILED
         ticket.error = f"{message}: {detail}" if detail else message
-        await self._repository.save_ticket(ticket)
-        await self._audit.record(
+        event = self._audit.event(
             ticket.ticket_id,
             "ticket.failed",
             actor="system",
             detail={"error": ticket.error},
         )
+        await self._repository.save_ticket(ticket, audit_events=(event,))
         return ticket
 
     async def _require_ticket(self, ticket_id: str) -> Ticket:

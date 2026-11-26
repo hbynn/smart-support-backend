@@ -171,6 +171,7 @@ async def lifespan(app: FastAPI):
     from tooling.mcp_client import StandardMCPClient, load_servers
     from tooling.mcp_server import configure
     global _support_repository, _ticket_workflow
+    from audit.outbox import audit_outbox_worker
     from domain.repository import SupportRepository
     from tooling.support_tools import SupportTools, register_support_tools
     from workflow.ticket_workflow import TicketWorkflow
@@ -229,7 +230,8 @@ async def lifespan(app: FastAPI):
     logger.info("智能客服工单平台 已就绪")
     async with standard_mcp_server.session_manager.run():
         try:
-            yield
+            async with audit_outbox_worker(_support_repository):
+                yield
         finally:
             await _eval_jobs.close()
             await _profile_updater.close()

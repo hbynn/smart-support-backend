@@ -105,6 +105,18 @@ class SupportRepository:
                     FOREIGN KEY(ticket_id) REFERENCES tickets(ticket_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS audit_outbox (
+                    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticket_id TEXT NOT NULL REFERENCES tickets(ticket_id),
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_audit_outbox_ticket
+                    ON audit_outbox(ticket_id, outbox_id);
+
                 CREATE TABLE IF NOT EXISTS ticket_mentions (
                     user_id TEXT NOT NULL, conv_id TEXT NOT NULL, request_id TEXT NOT NULL,
                     ticket_id TEXT NOT NULL REFERENCES tickets(ticket_id), mentioned_at TEXT NOT NULL,
@@ -168,10 +180,14 @@ class SupportRepository:
             row = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
         return self._order_from_row(row) if row else None
 
-    async def create_ticket(self, ticket: Ticket) -> Tuple[Ticket, bool]:
-        return await asyncio.to_thread(self._create_ticket_sync, ticket)
+    async def create_ticket(
+        self, ticket: Ticket, *, audit_events: tuple[AuditEvent, ...] = ()
+    ) -> Tuple[Ticket, bool]:
+        return await asyncio.to_thread(self._create_ticket_sync, ticket, audit_events)
 
-    def _create_ticket_sync(self, ticket: Ticket) -> Tuple[Ticket, bool]:
+    def _create_ticket_sync(
+        self, ticket: Ticket, audit_events: tuple[AuditEvent, ...]
+    ) -> Tuple[Ticket, bool]:
         try:
             with closing(self._connect()) as conn, conn:
                 conn.execute(
@@ -184,6 +200,7 @@ class SupportRepository:
                     """,
                     self._ticket_values(ticket),
                 )
+                self._enqueue_audit_events(conn, audit_events)
             return ticket, True
         except sqlite3.IntegrityError as ex:
             with closing(self._connect()) as conn, conn:
@@ -202,12 +219,14 @@ class SupportRepository:
             row = conn.execute("SELECT * FROM tickets WHERE ticket_id = ?", (ticket_id,)).fetchone()
         return self._ticket_from_row(row) if row else None
 
-    async def save_ticket(self, ticket: Ticket) -> Ticket:
-        return await asyncio.to_thread(self._save_ticket_sync, ticket)
+    async def save_ticket(
+        self, ticket: Ticket, *, audit_events: tuple[AuditEvent, ...] = ()
+    ) -> Ticket:
+        return await asyncio.to_thread(self._save_ticket_sync, ticket, audit_events)
 
-    def _save_ticket_sync(self, ticket: Ticket) -> Ticket:
+    def _save_ticket_sync(self, ticket: Ticket, audit_events: tuple[AuditEvent, ...]) -> Ticket:
         old_version = ticket.version
-        ticket.updated_at = utc_now()
+        updated_at = utc_now()
         new_version = old_version + 1
         values = (
             ticket.state.value,
@@ -221,7 +240,7 @@ class SupportRepository:
             json.dumps(ticket.result, ensure_ascii=False),
             ticket.error,
             new_version,
-            ticket.updated_at,
+            updated_at,
             ticket.ticket_id,
             old_version,
         )
@@ -238,7 +257,9 @@ class SupportRepository:
             )
             if cursor.rowcount != 1:
                 raise ConcurrencyError(f"工单 {ticket.ticket_id} 已被其他请求更新")
+            self._enqueue_audit_events(conn, audit_events)
         ticket.version = new_version
+        ticket.updated_at = updated_at
         return ticket
 
     async def create_refund_once(
@@ -329,6 +350,14 @@ class SupportRepository:
                 "UPDATE orders SET status = ? WHERE order_id = ?",
                 (OrderStatus.REFUNDED.value, order_id),
             )
+            event = AuditEvent(
+                event_id=None,
+                ticket_id=ticket_id,
+                event_type="refund.command_accepted",
+                actor="system",
+                detail={**record.to_dict(), "idempotent_replay": False},
+            )
+            self._enqueue_audit_events(conn, (event,))
             conn.commit()
             return record, True
         except sqlite3.IntegrityError:
@@ -355,31 +384,73 @@ class SupportRepository:
             ).fetchone()
         return self._refund_from_row(row) if row else None
 
-    async def add_audit_event(self, event: AuditEvent) -> AuditEvent:
-        event.event_id = await asyncio.to_thread(self._add_audit_event_sync, event)
-        return event
+    async def enqueue_audit_event(self, event: AuditEvent) -> None:
+        await asyncio.to_thread(self._enqueue_audit_event_sync, event)
 
-    def _add_audit_event_sync(self, event: AuditEvent) -> int:
+    def _enqueue_audit_event_sync(self, event: AuditEvent) -> None:
         with closing(self._connect()) as conn, conn:
-            cursor = conn.execute(
+            self._enqueue_audit_events(conn, (event,))
+
+    @staticmethod
+    def _enqueue_audit_events(conn: sqlite3.Connection, events: tuple[AuditEvent, ...]) -> None:
+        if events:
+            conn.executemany(
                 """
-                INSERT INTO audit_events(ticket_id,event_type,actor,detail,created_at)
-                VALUES(?,?,?,?,?)
+                INSERT INTO audit_outbox(ticket_id, event_type, actor, detail, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    event.ticket_id,
-                    event.event_type,
-                    event.actor,
-                    json.dumps(event.detail, ensure_ascii=False),
-                    event.created_at,
+                    (
+                        event.ticket_id,
+                        event.event_type,
+                        event.actor,
+                        json.dumps(event.detail, ensure_ascii=False),
+                        event.created_at,
+                    )
+                    for event in events
                 ),
             )
-            return int(cursor.lastrowid)
+
+    async def publish_audit_events(self) -> int:
+        return await asyncio.to_thread(self._publish_audit_events_sync)
+
+    def _publish_audit_events_sync(self, *, ticket_id: str | None = None, limit: int = 100) -> int:
+        where = "WHERE ticket_id = ?" if ticket_id is not None else ""
+        params = (ticket_id,) if ticket_id is not None else ()
+        with closing(self._connect()) as conn, conn:
+            if conn.execute(f"SELECT 1 FROM audit_outbox {where} LIMIT 1", params).fetchone() is None:
+                return 0
+
+            # 持有写锁后才选待办。写审计和移除待办一起提交，失败则两者一起回滚。
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                f"""
+                SELECT outbox_id, ticket_id, event_type, actor, detail, created_at
+                FROM audit_outbox {where} ORDER BY outbox_id LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+            conn.executemany(
+                """
+                INSERT INTO audit_events(ticket_id, event_type, actor, detail, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    (row["ticket_id"], row["event_type"], row["actor"], row["detail"], row["created_at"])
+                    for row in rows
+                ),
+            )
+            conn.executemany(
+                "DELETE FROM audit_outbox WHERE outbox_id = ?", ((row["outbox_id"],) for row in rows)
+            )
+            return len(rows)
 
     async def list_audit_events(self, ticket_id: str) -> List[AuditEvent]:
         return await asyncio.to_thread(self._list_audit_events_sync, ticket_id)
 
     def _list_audit_events_sync(self, ticket_id: str) -> List[AuditEvent]:
+        # 审计查询保留刚提交即可读取的行为，仅追平这张工单的待办。
+        self._publish_audit_events_sync(ticket_id=ticket_id, limit=-1)
         with closing(self._connect()) as conn, conn:
             rows = conn.execute(
                 "SELECT * FROM audit_events WHERE ticket_id = ? ORDER BY event_id",

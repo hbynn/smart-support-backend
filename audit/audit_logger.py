@@ -22,15 +22,25 @@ class AuditLogger:
         *,
         actor: str,
         detail: Dict[str, Any] | None = None,
+    ) -> None:
+        event = self.event(ticket_id, event_type, actor=actor, detail=detail)
+        await self._repository.enqueue_audit_event(event)
+
+    @staticmethod
+    def event(
+        ticket_id: str,
+        event_type: str,
+        *,
+        actor: str,
+        detail: Dict[str, Any] | None = None,
     ) -> AuditEvent:
-        event = AuditEvent(
+        return AuditEvent(
             event_id=None,
             ticket_id=ticket_id,
             event_type=event_type,
             actor=actor,
             detail=detail or {},
         )
-        return await self._repository.add_audit_event(event)
 
     async def list_for_ticket(self, ticket_id: str) -> List[Dict[str, Any]]:
         events = await self._repository.list_audit_events(ticket_id)
