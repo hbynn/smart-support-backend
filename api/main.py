@@ -563,22 +563,27 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
                 previous = ChatResponse(**receipt["response"])
                 if previous.status != "failed" or not previous.retryable:
                     return render(previous)
-            from workflow.ticket_lookup import status_answer
+            from workflow.ticket_lookup import split_status_request, status_answer
+            agent_message = req.message
+            lookup_answer = None
             if _support_repository is not None:
-                lookup = await status_answer(_support_repository, req.user_id, conv_id, req.message)
+                status_question, additional_request = split_status_request(req.message)
+                lookup = await status_answer(_support_repository, req.user_id, conv_id, status_question)
                 if lookup is not None:
-                    answer, ticket_id = lookup
+                    lookup_answer, ticket_id = lookup
                     if ticket_id:
                         await _support_repository.link_ticket(req.user_id, conv_id, client_id, ticket_id)
-                    response = ChatResponse(conv_id=conv_id, request_id=client_id, response=answer,
-                        intent="refund", intent_group="billing", agent_type="billing", primary_agent="billing",
-                        tools_used=["get_my_ticket_status"], escalated=False,
-                        latency_ms=round((time.monotonic() - started) * 1000, 1))
-                    await _memory.commit_turn(req.user_id, conv_id, client_id, req.message, response.model_dump())
-                    return response
+                    if additional_request is None:
+                        response = ChatResponse(conv_id=conv_id, request_id=client_id, response=lookup_answer,
+                            intent="refund", intent_group="billing", agent_type="billing", primary_agent="billing",
+                            tools_used=["get_my_ticket_status"], escalated=False,
+                            latency_ms=round((time.monotonic() - started) * 1000, 1))
+                        await _memory.commit_turn(req.user_id, conv_id, client_id, req.message, response.model_dump())
+                        return response
+                    agent_message = additional_request
             # 1. 读取记忆上下文
             with measure_stage("memory_read"):
-                mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
+                mem_ctx = await _memory.get_context(req.user_id, conv_id, query=agent_message)
 
             # 2. 构建编排请求（含对话历史，用于意图识别上下文）
             history = [
@@ -587,11 +592,11 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
             ] if mem_ctx.recent_messages else None
 
             with measure_stage("intent"):
-                intent_result = await _orchestrator.recognize_intent(req.message, history=history)
+                intent_result = await _orchestrator.recognize_intent(agent_message, history=history)
             full_context = mem_ctx.to_prompt_text()
 
             orch_req = OrcReq(
-                message=req.message,
+                message=agent_message,
                 user_id=req.user_id,
                 conv_id=conv_id,
                 context=full_context,
@@ -618,17 +623,23 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
             with measure_stage("agent_execution"):
                 result = await _orchestrator.run(orch_req)
 
+            response_text = result.response
+            tools_used = result.tools_used
+            if lookup_answer is not None:
+                response_text = f"{lookup_answer}\n\n{response_text}"
+                tools_used = ["get_my_ticket_status", *tools_used]
+
             response = ChatResponse(
                 conv_id=conv_id,
                 request_id=result.request_id,
-                response=result.response,
+                response=response_text,
                 intent=result.intent.value if result.intent else "other",
                 intent_group=intent_result.intent_group,
                 agent_type=result.agent_type.value,
                 agent_types=[agent_type.value for agent_type in result.agent_types],
                 primary_agent=result.primary_agent.value if result.primary_agent else result.agent_type.value,
                 supporting_agents=[agent_type.value for agent_type in result.supporting_agents],
-                tools_used=result.tools_used,
+                tools_used=tools_used,
                 routing_reason=result.routing_reason,
                 routing_confidence=result.routing_confidence,
                 escalated=result.escalated,

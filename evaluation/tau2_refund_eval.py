@@ -95,13 +95,14 @@ def grade(case, ticket_ids, agent, run, before, after):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", default="http://127.0.0.1:18000")
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     args = parser.parse_args()
     if not DB_PATH.is_file():
         parser.error(f"找不到隔离测试数据库 {DB_PATH}，请先启动评测 Compose 服务。")
 
     case = json.loads(CASE_PATH.read_text(encoding="utf-8"))
-    with httpx.Client(base_url="http://127.0.0.1:18000", timeout=60, trust_env=False) as client:
+    with httpx.Client(base_url=args.base_url, timeout=60, trust_env=False) as client:
         client.get("/health").raise_for_status()
         ticket_ids = prepare_tickets(client, case)
         before = read_results(case, ticket_ids)
